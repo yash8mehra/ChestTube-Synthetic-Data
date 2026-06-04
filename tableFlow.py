@@ -1,0 +1,13 @@
+#FEATURES TO INCLUDE
+#STUDY ID
+#TIMESTAMPS (every 10 minutes)
+#MEASURED PLEURAL PRESSURE
+#AIRFLOW LEAK
+#LOWLESS FLUID OUTPUT
+
+import pandas as pd
+import numpy as np
+
+
+
+
