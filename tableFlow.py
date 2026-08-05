@@ -1,627 +1,489 @@
-
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from tableCXR import manifest
-def generate_flow(row):
-    """
-    Generate a FLOW table for one patient.
+from sklearn.metrics import roc_auc_score
 
-    Clinical reasoning
-    ------------------
-    After thoracic surgery the chest drain is connected immediately (time 0).
-    Two physiological processes produce measurable output:
+GRADES = ["Z", "O", "T", "Th"]
 
-    1. AirLeakFlow (mL/min or arbitrary pump units):
-       The visceral pleural fissure leaks air as the lung re-expands.
-       Leakage is not constant — it varies with breathing depth, patient
-       movement, and healing state.  We model it as a piecewise-stable
-       base rate that changes every 1–2 hours (the "segment" approach),
-       with small per-reading noise added on top.  The base rate decays
-       over the full hospital stay to simulate gradual sealing of the leak.
-       Occasional spikes (coughing, deep breaths) are injected randomly.
-       Real data shows ~50 % of readings below 5 units, median ~1–2,
-       with sporadic large spikes up to several hundred.
 
-    2. LOWESSFluidOutput (integer mL per 10-minute interval):
-       Surgical trauma causes inflammation; lymphatic fluid and blood serum
-       accumulate in the pleural space and are drained continuously.
-       Output is highest immediately post-op and declines as healing
-       progresses.  The LOWESS label implies the values represent a
-       smoothed (locally-weighted) estimate of instantaneous drainage —
-       so each row is that interval's output, not a running total.
-       Real-world drainage ranges from ~0–10 mL per 10 min during the
-       later post-op period, but can be 10–30 mL/10 min early on.
+def make_manifest(num_patients=None):
+    if num_patients is None:
+        num_patients = 100
 
-    3. MeasuredPleuralPressure (cmH2O, negative pressure):
-       The drain maintains sub-atmospheric pressure in the pleural space
-       to re-expand the lung.  Typical targets are −0.75 to −5 cmH2O.
-       Small breath-by-breath fluctuations occur around the set point.
-       We represent the magnitude (stored as a positive float per the
-       real dataset convention) with a slowly-drifting mean and small
-       Gaussian noise.
-    """
+    study_ids = [f"{i:03d}" for i in range(1, num_patients + 1)]
+    all_possible_starts = pd.date_range("2026-01-01", "2026-05-28", freq="h")
+    surgery_starts = np.random.choice(all_possible_starts, size=num_patients)
+    surgery_starts = pd.Series(surgery_starts).reset_index(drop=True)
+    surgery_type = np.random.choice(["VATS", "Open"], size=num_patients, p=[0.7, 0.3])
 
-    studyid  = row["StudyID"]
-    start    = row["SurgeryStart"]
-    duration = row["DurationHours"]
+    duration_hours = np.random.randint(24, 120, size=num_patients)
+    long_stay_count = min(max(1, round(num_patients * 0.1)), num_patients)
+    long_stay_idx = np.random.choice(num_patients, size=long_stay_count, replace=False)
+    duration_hours[long_stay_idx] = np.random.randint(120, 125, size=long_stay_count)
 
-    # -------------------------------------------------------------------------
-    # Build the timestamp spine — every 10 minutes from surgery start
-    # -------------------------------------------------------------------------
-    end = start + pd.Timedelta(hours=duration)
+    return pd.DataFrame({
+        "StudyID": study_ids,
+        "SurgeryStart": surgery_starts,
+        "DurationHours": duration_hours.astype(int),
+        "SurgeryType": surgery_type,
+    })
 
-    # pd.date_range guarantees exact 10-minute alignment
-    timestamps = pd.date_range(start=start, end=end, freq="10min")
 
-    n = len(timestamps)   # total number of readings for this patient
+def generate_cxr(manifest_data):
+    all_cxr = []
 
-    # -------------------------------------------------------------------------
-    # SEGMENT STRUCTURE: leakage rate changes every 1–2 hours
-    # Each segment has its own base AirLeakFlow rate and fluid drainage rate.
-    # This simulates clinical reality: the patient coughs, changes position,
-    # or the wound shifts, causing a step-change in drain output.
-    # -------------------------------------------------------------------------
-    readings_per_hour = 6               # 6 readings × 10 min = 60 min
-    min_seg = 1 * readings_per_hour     # shortest segment: 1 hour
-    max_seg = 2 * readings_per_hour     # longest segment:  2 hours
+    for _, row in manifest_data.iterrows():
+        studyid = row["StudyID"]
+        start = row["SurgeryStart"]
+        duration_hrs = row["DurationHours"]
 
-    # Pre-allocate arrays for efficiency (matches the existing CXR style of
-    # building a list of rows, but we compute arrays first then zip them)
-    air_leak_base   = np.zeros(n)
-    fluid_base      = np.zeros(n)
+        current = start + pd.Timedelta(hours=4)
+        end = start + pd.Timedelta(hours=duration_hrs)
+        times = []
 
-    # Fill segment by segment
+        while current < end:
+            times.append(current.round("10s"))
+            gap_hours = np.random.uniform(12, 168)
+            current = current + pd.Timedelta(hours=gap_hours)
+
+        rows = []
+        for t in times:
+            rows.append({
+                "StudyID": studyid,
+                "EventDate": t,
+                "Effusion": np.random.choice(GRADES),
+                "PneumothoraxSize": np.random.choice(GRADES),
+                "SubcuEmphysema": np.random.choice(GRADES),
+            })
+
+        all_cxr.append(pd.DataFrame(rows))
+
+    cxr = pd.concat(all_cxr, ignore_index=True)
+    cxr = cxr.sort_values(by=["StudyID", "EventDate"])
+    cxr["EventDate"] = cxr["EventDate"].dt.strftime("%Y-%m-%d %H:%M")
+    return cxr
+
+
+def generate_synthetic_data(num_patients=None):
+    manifest_data = make_manifest(num_patients)
+    cxr_data = generate_cxr(manifest_data)
+    return manifest_data, cxr_data
+
+
+def make_timestamps(start, duration_hours):
+    end = start + pd.Timedelta(hours=duration_hours)
+    return pd.date_range(start=start, end=end, freq="10min")
+
+
+def sample_segment_rates(n):
+    air_base = np.zeros(n)
+    fluid_base = np.zeros(n)
+    readings_per_hour = 6
     i = 0
-    while i < n:
-        seg_len = np.random.randint(min_seg, max_seg + 1)
-        seg_end = min(i + seg_len, n)
 
-        # --- AirLeakFlow base for this segment ---
-        # Fixed clinical rates based on post-op healing trajectory.
-        # progress ∈ [0, 1] tracks how far through the stay we are.
+    while i < n:
+        seg_end = min(i + np.random.randint(readings_per_hour, 2 * readings_per_hour + 1), n)
         progress = i / n
 
-        # Fixed rates based on clinical data:
-        # Early (0-24h): 2.0-5.0 mL/min
-        # Mid (24-72h): 1.0-2.0 mL/min
-        # Late (72h+): 0.5-1.0 mL/min (approaching removal threshold)
-        if progress < 0.083:  # First 24 hours (0.083 ≈ 1/12)
-            seg_air = np.random.uniform(2.0, 5.0)
-        elif progress < 0.333:  # 24-72 hours
-            seg_air = np.random.uniform(1.0, 2.0)
-        else:  # 72+ hours
-            seg_air = np.random.uniform(0.5, 1.0)
-
-        # --- LOWESSFluidOutput base for this segment (mL per 10 min) ---
-        # Fixed clinical rates based on post-thoracotomy drainage patterns.
-        # Early post-op: 5–20 mL/10 min
-        # Mid post-op (day 2-3): 1–5 mL/10 min
-        # Late post-op (day 4+): <1 mL/10 min
-        if progress < 0.083:  # First 24 hours
-            seg_fluid = np.random.uniform(5, 20)
-        elif progress < 0.333:  # 24-72 hours
-            seg_fluid = np.random.uniform(1, 5)
-        else:  # 72+ hours
-            seg_fluid = np.random.uniform(0, 1)
-
-        air_leak_base[i:seg_end]  = seg_air
-        fluid_base[i:seg_end]     = seg_fluid
+        if progress < 0.083:
+            air_base[i:seg_end] = np.random.uniform(2.0, 5.0)
+            fluid_base[i:seg_end] = np.random.uniform(5, 20)
+        elif progress < 0.333:
+            air_base[i:seg_end] = np.random.uniform(1.0, 2.0)
+            fluid_base[i:seg_end] = np.random.uniform(1, 5)
+        else:
+            air_base[i:seg_end] = np.random.uniform(0.5, 1.0)
+            fluid_base[i:seg_end] = np.random.uniform(0, 1)
 
         i = seg_end
 
-    # -------------------------------------------------------------------------
-    # PER-READING NOISE on top of the segment base
-    # -------------------------------------------------------------------------
+    return air_base, fluid_base
 
-    # AirLeakFlow: multiplicative noise so quiet periods stay quiet and
-    # active periods have proportionally larger swings.
-    air_noise = np.abs(np.random.normal(1.0, 0.4, size=n))
-    air_leak  = air_leak_base * air_noise
 
-    # Random spikes: ~3 % of readings get a large cough/movement spike.
-    # Spike magnitude is drawn from a heavy-tailed distribution to match
-    # the real data's occasional values in the 100–1000 range.
+def make_air_leak(air_base):
+    n = len(air_base)
+    air_leak = air_base * np.abs(np.random.normal(1.0, 0.4, size=n))
     spike_mask = np.random.random(n) < 0.03
-    spike_vals = np.random.exponential(scale=150, size=n)
-    air_leak   = np.where(spike_mask, air_leak + spike_vals, air_leak)
-    air_leak   = np.clip(np.round(air_leak, 2), 0, 1000)
-
-    # LOWESSFluidOutput: additive Gaussian noise; clipped to non-negative
-    # integer mL (matches the integer dtype in the real dataset).
-    fluid_noise  = np.random.normal(0, fluid_base * 0.25 + 0.5, size=n)
-    fluid_output = np.round(fluid_base + fluid_noise).astype(int)
-    fluid_output = np.clip(fluid_output, 0, 500)   # physiological ceiling
-
-    # -------------------------------------------------------------------------
-    # MeasuredPleuralPressure
-    # Pleural pressure is set by the drain unit, typically −1 to −2 cmH2O,
-    # with breath-to-breath fluctuations of ±0.1–0.3 cmH2O.
-    # We store the magnitude as a positive float (matching real dataset).
-    # A slowly-drifting mean (random walk) keeps it from being constant.
-    # -------------------------------------------------------------------------
-    # Each patient has their own target pressure set by the clinician
-    target_pressure = np.random.uniform(1.0, 2.5)
-
-    # Small random walk for drift (cumulative sum of tiny steps)
-    drift_steps = np.random.normal(0, 0.01, size=n)
-    drift       = np.cumsum(drift_steps)
-
-    # Breath-by-breath noise
-    breath_noise = np.random.normal(0, 0.08, size=n)
-
-    pleural_pressure = target_pressure + drift + breath_noise
-    # Clip to realistic physiological range (0.75–5.0 cmH2O magnitude)
-    pleural_pressure = np.clip(np.round(pleural_pressure, 2), 0.75, 5.0)
-
-    rows = []
-
-    for j in range(n):
-
-        row_data = {
-            "StudyID":                studyid,
-            "Timestamp":              timestamps[j],
-            "MeasuredPleuralPressure": pleural_pressure[j],
-            "AirLeakFlow":             air_leak[j],
-            "LOWESSFluidOutput":       fluid_output[j]
-        }
-
-        rows.append(row_data)
-
-    return pd.DataFrame(rows)
+    air_leak[spike_mask] += np.random.exponential(scale=150, size=spike_mask.sum())
+    return np.clip(np.round(air_leak, 2), 0, 1000)
 
 
-# =============================================================================
-# REMOVAL READINESS LOGIC
-# =============================================================================
+def make_fluid_output(fluid_base):
+    noise = np.random.normal(0, fluid_base * 0.25 + 0.5, size=fluid_base.shape)
+    fluid_output = np.round(fluid_base + noise).astype(int)
+    return np.clip(fluid_output, 0, 500)
 
 
-# =============================================================================
-# PATIENT CLUSTERING & PROFILING
-# =============================================================================
+def make_pressure(n):
+    target = np.random.uniform(-1.5, 0.5)
+    drift = np.cumsum(np.random.normal(0, 0.01, size=n))
+    noise = np.random.normal(0, 0.08, size=n)
+    pressure = target + drift + noise
+    return np.clip(np.round(pressure, 2), -3.0, 1.5)
+
+
+def generate_flow(row):
+    studyid = row["StudyID"]
+    start = row["SurgeryStart"]
+    duration = row["DurationHours"]
+
+    timestamps = make_timestamps(start, duration)
+    n = len(timestamps)
+
+    air_base, fluid_base = sample_segment_rates(n)
+    air_leak = make_air_leak(air_base)
+    fluid_output = make_fluid_output(fluid_base)
+    pleural_pressure = make_pressure(n)
+
+    return pd.DataFrame({
+        "StudyID": studyid,
+        "Timestamp": timestamps,
+        "MeasuredPleuralPressure": pleural_pressure,
+        "AirLeakFlow": air_leak,
+        "LOWESSFluidOutput": fluid_output,
+    })
+
 
 def classify_patient_profile(patient_flow, start_time):
-    """
-    Classify patient into clinical profile based on early (first 24h) flow characteristics.
-    
-    Profiles:
-    - SEVERE: High air leak + high fluid output
-    - MODERATE: Mixed air leak and fluid output
-    - MILD: Low air leak + low fluid output
-    """
-    early_window = patient_flow[
-        (patient_flow['Timestamp'] >= start_time) &
-        (patient_flow['Timestamp'] < start_time + pd.Timedelta(hours=24))
+    window = patient_flow[
+        (patient_flow["Timestamp"] >= start_time) &
+        (patient_flow["Timestamp"] < start_time + pd.Timedelta(hours=24))
     ]
-    
-    if len(early_window) == 0:
-        return 'UNKNOWN'
-    
-    avg_air = early_window['AirLeakFlow'].mean()
-    avg_fluid = early_window['LOWESSFluidOutput'].mean()
-    
-    # Thresholds
-    air_threshold = 3.0
-    fluid_threshold = 10.0
-    
-    if avg_air > air_threshold and avg_fluid > fluid_threshold:
-        return 'SEVERE'
-    elif avg_air > air_threshold or avg_fluid > fluid_threshold:
-        return 'MODERATE'
-    else:
-        return 'MILD'
+
+    if window.empty:
+        return "UNKNOWN"
+
+    avg_air = window["AirLeakFlow"].mean()
+    avg_fluid_rate = window["LOWESSFluidOutput"].mean() / 10.0
+
+    if avg_air > 10.0 and avg_fluid_rate > 3.0:
+        return "SEVERE"
+    if avg_air > 10.0 or avg_fluid_rate > 3.0:
+        return "MODERATE"
+    return "MILD"
 
 
-# =============================================================================
-# CXR-BASED REMOVAL VALIDATION
-# =============================================================================
+def validate_cxr_for_removal(patient_cxr, removal_time):
+    if patient_cxr.empty:
+        return True
 
-def validate_cxr_for_removal(patient_cxr, removal_time, early_only=True):
-    """
-    Validate CXR findings for removal readiness.
-    
-    CXR values (0 or 1 indicate readiness):
-    - Effusion: 0 = resolved, 1 = minimal
-    - PneumothoraxSize: 0 = resolved, 1 = minimal
-    
-    Early post-op only: Check CXR only if within first 72 hours
-    """
-    if len(patient_cxr) == 0:
-        return True  # No CXR data, assume valid
-    
     patient_cxr = patient_cxr.copy()
-    patient_cxr['EventDate'] = pd.to_datetime(patient_cxr['EventDate'])
-    
-    # Get closest CXR before removal time
-    cxr_before_removal = patient_cxr[patient_cxr['EventDate'] <= removal_time]
-    
-    if len(cxr_before_removal) == 0:
+    patient_cxr["EventDate"] = pd.to_datetime(patient_cxr["EventDate"])
+    before = patient_cxr[patient_cxr["EventDate"] <= removal_time]
+
+    if before.empty:
         return True
-    
-    latest_cxr = cxr_before_removal.iloc[-1]
-    hours_since_surgery = (removal_time - patient_cxr['EventDate'].min()).total_seconds() / 3600
-    
-    # Only validate CXR in early post-op (first 72 hours)
-    if early_only and hours_since_surgery > 72:
-        return True
-    
-    # Map grades to numeric (Z=0, O=1, T=2, Th=3)
-    grade_map = {'Z': 0, 'O': 1, 'T': 2, 'Th': 3}
-    effusion_score = grade_map.get(latest_cxr['Effusion'], 2)
-    pneumo_score = grade_map.get(latest_cxr['PneumothoraxSize'], 2)
-    
-    # Valid for removal if both are 0 or 1 (Z or O)
-    is_valid = effusion_score <= 1 and pneumo_score <= 1
-    
-    return is_valid
+
+    grade_map = {"Z": 0, "O": 1, "T": 2, "Th": 3}
+    latest = before.iloc[-1]
+    return (
+        grade_map.get(latest["Effusion"], 2) <= 1 and
+        grade_map.get(latest["PneumothoraxSize"], 2) <= 1
+    )
 
 
-# =============================================================================
-# PER-HOUR REMOVAL DECISIONS WITH AUC TRACKING
-# =============================================================================
+def normalized_flow_limits(window_data):
+    air_max = window_data["AirLeakFlow"].max()
+    fluid_rate = window_data["LOWESSFluidOutput"].max() / 10.0
+    pressure_mean = window_data["MeasuredPleuralPressure"].mean()
+    pressure_min = window_data["MeasuredPleuralPressure"].min()
+    pressure_ok = pressure_mean < 0.0 and pressure_min < 0.0
+    return air_max, fluid_rate, pressure_mean, pressure_ok, air_max <= 10.0 and fluid_rate <= 3.0 and pressure_ok
 
-def predict_removals_hourly(flow, cxr, manifest_data):
-    """
-    Predict chest tube removal with HOURLY granularity.
-    
-    Returns: 
-    - removal_predictions: DataFrame with per-patient removal summary
-    - hourly_removals: DataFrame with per-hour removal decisions
-    """
-    removal_predictions = []
-    hourly_removals = []
-    
-    for _, patient_row in manifest_data.iterrows():
-        studyid = patient_row['StudyID']
-        start_time = patient_row['SurgeryStart']
-        duration_hours = patient_row['DurationHours']
-        
-        patient_flow = flow[flow['StudyID'] == studyid].copy()
-        patient_cxr = cxr[cxr['StudyID'] == studyid].copy()
-        patient_flow['Timestamp'] = pd.to_datetime(patient_flow['Timestamp'])
-        
-        # Classify patient profile early
+
+def hourly_removal_probability(hour):
+    if hour < 12:
+        return 0.0
+    if hour < 120:
+        return 0.05
+    return 0.0
+
+
+def predict_removals_hourly(flow, cxr_data, manifest_data):
+    records = []
+    hourly = []
+    flow = flow.copy()
+    flow["Timestamp"] = pd.to_datetime(flow["Timestamp"])
+
+    for _, patient in manifest_data.iterrows():
+        studyid = patient["StudyID"]
+        start_time = patient["SurgeryStart"]
+        duration_hours = patient["DurationHours"]
+
+        patient_flow = flow[flow["StudyID"] == studyid]
+        patient_cxr = cxr_data[cxr_data["StudyID"] == studyid]
         profile = classify_patient_profile(patient_flow, start_time)
-        
-        # Force non-removal for 120+ hour stays
         force_no_removal = duration_hours >= 120
-        
+
         removal_time = None
         removal_hour = None
         removal_probability_final = 0.0
-        removal_hour_decision = []
-        
-        # Check EVERY HOUR (not 12-hour segments)
+
         for hour in range(1, int(duration_hours) + 1):
-            hour_start = start_time + pd.Timedelta(hours=hour - 1)
             hour_end = start_time + pd.Timedelta(hours=hour)
-            eight_hours_ago = hour_end - pd.Timedelta(hours=8)
-            
-            # Get data from this hour and 8-hour lookback
-            hour_data = patient_flow[
-                (patient_flow['Timestamp'] >= hour_start) &
-                (patient_flow['Timestamp'] < hour_end)
-            ]
-            
             window_data = patient_flow[
-                (patient_flow['Timestamp'] >= eight_hours_ago) &
-                (patient_flow['Timestamp'] <= hour_end)
+                (patient_flow["Timestamp"] >= hour_end - pd.Timedelta(hours=8)) &
+                (patient_flow["Timestamp"] <= hour_end)
             ]
-            
-            if len(window_data) == 0:
+
+            if window_data.empty:
                 continue
-            
-            # Check 3ml/min threshold over 8-hour window
-            air_leak_max = window_data['AirLeakFlow'].max()
-            fluid_max_per_min = window_data['LOWESSFluidOutput'].max() / 10.0
-            meets_flow_criteria = (air_leak_max <= 3.0) and (fluid_max_per_min <= 3.0)
-            
-            # Calculate removal probability for this hour
-            if hour < 12:
-                prob = 0.0  # First 12 hours: no removal
-            elif hour < 24:
-                prob = 0.04  # Hours 12-24: 4% per hour
-            elif hour < 120:
-                # Hours 24-120: increasing rate (5% per hour average)
-                prob = 0.04 + (0.01 * (hour - 24) / 96)
-            else:
-                prob = 0.05  # After 120h: 5% per hour (if not forced no-removal)
-            
-            # If 120+ hours, force no removal
-            if force_no_removal:
-                prob = 0.0
-            
-            # Check CXR validation (only if meets flow criteria and early post-op)
+
+            air_max, fluid_rate, pressure_mean, pressure_ok, meets_criteria = normalized_flow_limits(window_data)
+            prob = 0.0 if force_no_removal else hourly_removal_probability(hour)
+
             cxr_valid = True
-            if meets_flow_criteria and hour <= 72:
-                cxr_valid = validate_cxr_for_removal(patient_cxr, hour_end, early_only=True)
-            
-            # Generate removal decision: random 0-1
-            removal_decision = np.random.random() < prob if (meets_flow_criteria and cxr_valid and not removal_time) else False
-            
-            hourly_removals.append({
-                'StudyID': studyid,
-                'Hour': hour,
-                'Timestamp': hour_end,
-                'AirLeakFlow_Max_8h': air_leak_max,
-                'FluidOutput_Max_PerMin_8h': fluid_max_per_min,
-                'MeetsFlowCriteria': meets_flow_criteria,
-                'CXRValid': cxr_valid,
-                'RemovalProbability': prob,
-                'RemovalDecision': removal_decision,
-                'Profile': profile
+            if meets_criteria and hour <= 72:
+                cxr_valid = validate_cxr_for_removal(patient_cxr, hour_end)
+
+            removal_decision = bool(
+                meets_criteria and
+                cxr_valid and
+                not removal_time and
+                np.random.random() < prob
+            )
+
+            hourly.append({
+                "StudyID": studyid,
+                "Hour": hour,
+                "Timestamp": hour_end,
+                "AirLeakFlow_Max_8h": air_max,
+                "FluidOutput_Max_PerMin_8h": fluid_rate,
+                "PressureMean_8h": pressure_mean,
+                "PressureOK_8h": pressure_ok,
+                "MeetsFlowCriteria": meets_criteria,
+                "CXRValid": cxr_valid,
+                "RemovalProbability": prob,
+                "RemovalDecision": removal_decision,
+                "Profile": profile,
             })
-            
-            if removal_decision and not removal_time:
+
+            if removal_decision:
                 removal_time = hour_end
                 removal_hour = hour
                 removal_probability_final = prob
-        
-        # Determine if patient gets removed
-        removed = removal_time is not None
-        
-        removal_predictions.append({
-            'StudyID': studyid,
-            'SurgeryStart': start_time,
-            'DurationHours': duration_hours,
-            'Profile': profile,
-            'RemovalTime': removal_time,
-            'RemovalHour': removal_hour,
-            'Removed': removed,
-            'RemovalProbability': removal_probability_final,
-            'HoursUntilRemoval': removal_hour if removal_hour else None,
-            'ForceNoRemoval': force_no_removal
+
+        records.append({
+            "StudyID": studyid,
+            "SurgeryStart": start_time,
+            "DurationHours": duration_hours,
+            "Profile": profile,
+            "RemovalTime": removal_time,
+            "RemovalHour": removal_hour,
+            "Removed": removal_time is not None,
+            "RemovalProbability": removal_probability_final,
+            "HoursUntilRemoval": removal_hour if removal_hour else None,
+            "ForceNoRemoval": force_no_removal,
         })
-    
-    removal_pred_df = pd.DataFrame(removal_predictions)
-    hourly_df = pd.DataFrame(hourly_removals)
-    
-    return removal_pred_df, hourly_df
+
+    return pd.DataFrame(records), pd.DataFrame(hourly)
 
 
-def predict_removals(flow, cxr, manifest_data):
-    """
-    Predict chest tube removal times for all patients.
-    
-    Returns: DataFrame with removal predictions and metrics
-    """
-    removal_results = []
-    
-    for _, patient_row in manifest_data.iterrows():
-        studyid = patient_row['StudyID']
-        start_time = patient_row['SurgeryStart']
-        duration_hours = patient_row['DurationHours']
-        
-        patient_flow = flow[flow['StudyID'] == studyid].copy()
-        patient_cxr = cxr[cxr['StudyID'] == studyid].copy()
-        patient_flow['Timestamp'] = pd.to_datetime(patient_flow['Timestamp'])
-        
-        removal_time = None
-        removal_probability = 0.0
-        
-        # Check each 12-hour segment
-        for hour_segment in range(12, duration_hours + 12, 12):
-            segment_start = start_time + pd.Timedelta(hours=hour_segment - 12)
-            segment_end = start_time + pd.Timedelta(hours=hour_segment)
-            
-            # Get readings in this segment
-            segment_data = patient_flow[
-                (patient_flow['Timestamp'] >= segment_start) &
-                (patient_flow['Timestamp'] <= segment_end)
-            ]
-            
-            if len(segment_data) == 0:
-                continue
-            
-            # Calculate removal probability for this segment
-            prob = calculate_removal_probability(segment_data, hour_segment, base_rate=0.05)
-            
-            # Generate random decision: remove or not?
-            if np.random.random() < prob:
-                # Find first timestamp in segment that meets 8-hour criterion
-                for idx, row in segment_data.iterrows():
-                    removal_time = row['Timestamp']
-                    removal_probability = prob
-                    break
-                
-                if removal_time:
-                    break
-        
-        # Determine if patient gets removed
-        removed = removal_time is not None
-        
-        removal_results.append({
-            'StudyID': studyid,
-            'SurgeryStart': start_time,
-            'DurationHours': duration_hours,
-            'RemovalTime': removal_time,
-            'Removed': removed,
-            'RemovalProbability': removal_probability,
-            'HoursUntilRemoval': (removal_time - start_time).total_seconds() / 3600 if removal_time else None
-        })
-    
-    return pd.DataFrame(removal_results)
-
-
-def plot_removal_metrics(removal_df, hourly_df, output_file='removal_analysis.png'):
-    """
-    Plot removal rate metrics and per-hour analysis.
-    """
+def plot_removal_metrics(removal_df, hourly_df, output_file="removal_analysis.png"):
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    
-    # 1. Removal rate per hour
-    if len(hourly_df) > 0:
-        hourly_decisions = hourly_df.groupby('Hour')['RemovalDecision'].sum()
-        axes[0, 0].plot(hourly_decisions.index, hourly_decisions.values, marker='o', linewidth=2, color='steelblue')
-        axes[0, 0].axvline(27, color='green', linestyle='--', alpha=0.7, label='Hour 27 (Total Separation)')
-        axes[0, 0].axvline(30, color='red', linestyle='--', alpha=0.7, label='Hour 30 (Breakdown)')
-        axes[0, 0].set_xlabel('Hours After Surgery')
-        axes[0, 0].set_ylabel('Number of Removals')
-        axes[0, 0].set_title('Chest Tube Removals per Hour')
+
+    if not hourly_df.empty:
+        hourly_decisions = hourly_df.groupby("Hour")["RemovalDecision"].sum()
+        axes[0, 0].plot(hourly_decisions.index, hourly_decisions.values, marker="o", linewidth=2, color="steelblue")
+        axes[0, 0].axvline(27, color="green", linestyle="--", alpha=0.7, label="Hour 27")
+        axes[0, 0].axvline(30, color="red", linestyle="--", alpha=0.7, label="Hour 30")
+        axes[0, 0].set_xlabel("Hours After Surgery")
+        axes[0, 0].set_ylabel("Number of Removals")
+        axes[0, 0].set_title("Chest Tube Removals per Hour")
         axes[0, 0].grid(alpha=0.3)
         axes[0, 0].legend()
-    
-    # 2. Removal probability distribution
-    axes[0, 1].hist(removal_df['RemovalProbability'], bins=20, color='coral', alpha=0.7, edgecolor='black')
-    axes[0, 1].set_xlabel('Removal Probability')
-    axes[0, 1].set_ylabel('Number of Patients')
-    axes[0, 1].set_title('Distribution of Removal Probabilities')
-    axes[0, 1].grid(axis='y', alpha=0.3)
-    
-    # 3. Removal vs Non-Removal counts
-    removal_counts = removal_df['Removed'].value_counts()
-    colors = ['#ff9999', '#90ee90']
-    axes[0, 2].pie(removal_counts.values, labels=['Not Removed', 'Removed'], autopct='%1.1f%%',
-                   colors=colors, startangle=90)
-    axes[0, 2].set_title('Overall Removal Rate')
-    
-    # 4. Removal probability over time
-    if len(hourly_df) > 0:
-        hourly_prob = hourly_df.groupby('Hour')['RemovalProbability'].mean()
-        axes[1, 0].plot(hourly_prob.index, hourly_prob.values, marker='o', linewidth=2, color='purple', markersize=6)
-        axes[1, 0].axvline(27, color='green', linestyle='--', alpha=0.7, label='Hour 27')
-        axes[1, 0].axvline(30, color='red', linestyle='--', alpha=0.7, label='Hour 30')
-        axes[1, 0].set_xlabel('Hours After Surgery')
-        axes[1, 0].set_ylabel('Average Removal Probability')
-        axes[1, 0].set_title('Removal Probability Trend')
+
+    axes[0, 1].hist(removal_df["RemovalProbability"], bins=20, color="coral", alpha=0.7, edgecolor="black")
+    axes[0, 1].set_xlabel("Removal Probability")
+    axes[0, 1].set_ylabel("Number of Patients")
+    axes[0, 1].set_title("Distribution of Removal Probabilities")
+    axes[0, 1].grid(axis="y", alpha=0.3)
+
+    removal_counts = removal_df["Removed"].value_counts()
+    axes[0, 2].pie(
+        removal_counts.values,
+        labels=["Not Removed", "Removed"],
+        autopct="%1.1f%%",
+        colors=["#ff9999", "#90ee90"],
+        startangle=90,
+    )
+    axes[0, 2].set_title("Overall Removal Rate")
+
+    if not hourly_df.empty:
+        hourly_prob = hourly_df.groupby("Hour")["RemovalProbability"].mean()
+        axes[1, 0].plot(hourly_prob.index, hourly_prob.values, marker="o", linewidth=2, color="purple", markersize=6)
+        axes[1, 0].axvline(27, color="green", linestyle="--", alpha=0.7, label="Hour 27")
+        axes[1, 0].axvline(30, color="red", linestyle="--", alpha=0.7, label="Hour 30")
+        axes[1, 0].set_xlabel("Hours After Surgery")
+        axes[1, 0].set_ylabel("Average Removal Probability")
+        axes[1, 0].set_title("Removal Probability Trend")
         axes[1, 0].grid(alpha=0.3)
         axes[1, 0].legend()
-    
-    # 5. Removals by patient profile
-    if 'Profile' in removal_df.columns:
-        profile_removal = removal_df.groupby('Profile')['Removed'].agg(['sum', 'count'])
-        profile_removal['rate'] = profile_removal['sum'] / profile_removal['count']
-        axes[1, 1].bar(profile_removal.index, profile_removal['rate'], color=['#ff6b6b', '#ffd93d', '#6bcf7f'], alpha=0.7)
-        axes[1, 1].set_ylabel('Removal Rate')
-        axes[1, 1].set_title('Removal Rate by Patient Profile')
+
+    if "Profile" in removal_df.columns:
+        profile_removal = removal_df.groupby("Profile")["Removed"].agg(["sum", "count"])
+        profile_removal["rate"] = profile_removal["sum"] / profile_removal["count"]
+        axes[1, 1].bar(profile_removal.index, profile_removal["rate"], color=["#ff6b6b", "#ffd93d", "#6bcf7f"], alpha=0.7)
+        axes[1, 1].set_ylabel("Removal Rate")
+        axes[1, 1].set_title("Removal Rate by Patient Profile")
         axes[1, 1].set_ylim([0, 1])
-        axes[1, 1].grid(axis='y', alpha=0.3)
-        for i, v in enumerate(profile_removal['rate']):
-            axes[1, 1].text(i, v + 0.02, f'{v:.2%}', ha='center')
-    
-    # 6. Force no-removal (120+ hours)
-    if 'ForceNoRemoval' in removal_df.columns:
-        long_stay_counts = removal_df['ForceNoRemoval'].value_counts()
-        axes[1, 2].bar(['<120h', '≥120h'], 
-                       [long_stay_counts.get(False, 0), long_stay_counts.get(True, 0)],
-                       color=['steelblue', 'orange'], alpha=0.7)
-        axes[1, 2].set_ylabel('Number of Patients')
-        axes[1, 2].set_title('Patient Stay Duration')
-        axes[1, 2].grid(axis='y', alpha=0.3)
-    
+        axes[1, 1].grid(axis="y", alpha=0.3)
+        for i, v in enumerate(profile_removal["rate"]):
+            axes[1, 1].text(i, v + 0.02, f"{v:.2%}", ha="center")
+
+    if "ForceNoRemoval" in removal_df.columns:
+        long_stay_counts = removal_df["ForceNoRemoval"].value_counts()
+        axes[1, 2].bar(["<120h", "≥120h"], [long_stay_counts.get(False, 0), long_stay_counts.get(True, 0)], color=["steelblue", "orange"], alpha=0.7)
+        axes[1, 2].set_ylabel("Number of Patients")
+        axes[1, 2].set_title("Patient Stay Duration")
+        axes[1, 2].grid(axis="y", alpha=0.3)
+
     plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"Removal analysis plot saved to {output_file}")
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
     plt.close()
 
 
-# =============================================================================
-# REMOVAL ANALYSIS & AUC CALCULATION
-# =============================================================================
+def build_flow_table(manifest_data):
+    return pd.concat([generate_flow(row) for _, row in manifest_data.iterrows()], ignore_index=True).sort_values(
+        by=["StudyID", "Timestamp"]
+    )
 
 
+def add_time_since_surgery(dataframe, manifest_data, timestamp_column):
+    result = dataframe.copy()
+    result = result.merge(manifest_data[["StudyID", "SurgeryStart"]], on="StudyID", how="left")
+    result[timestamp_column] = pd.to_datetime(result[timestamp_column])
+    result["SurgeryStart"] = pd.to_datetime(result["SurgeryStart"])
+    result["HoursSinceSurgery"] = (result[timestamp_column] - result["SurgeryStart"]).dt.total_seconds() / 3600.0
+    return result.drop(columns=["SurgeryStart"])
 
 
-# =============================================================================
-# Loop through the manifest — mirrors the CXR loop exactly
-# =============================================================================
+def build_hourly_feature_summary(flow_with_time, removal_predictions):
+    feature_cols = ["AirLeakFlow", "LOWESSFluidOutput", "MeasuredPleuralPressure"]
+    summary_input = flow_with_time.merge(
+        removal_predictions[["StudyID", "Removed"]], on="StudyID", how="left"
+    )
+    summary_input = summary_input.copy()
+    summary_input["Hour"] = np.floor(summary_input["HoursSinceSurgery"]).astype(int)
+    summary_input["Group"] = np.where(summary_input["Removed"], "Removed", "NotRemoved")
+    long_summary = summary_input.melt(
+        id_vars=["Hour", "Group"],
+        value_vars=feature_cols,
+        var_name="Feature",
+        value_name="Value",
+    )
+    summary_stats = (
+        long_summary.groupby(["Hour", "Feature", "Group"], as_index=False)["Value"]
+        .agg(Mean="mean", Std="std")
+    )
+    return summary_stats
 
-all_flow = []
 
-for _, row in manifest.iterrows():
+def build_auc_over_time(hourly_df, removal_predictions, next_n_hours=24):
+    feature_cols = ["AirLeakFlow_Max_8h", "FluidOutput_Max_PerMin_8h"]
+    auc_rows = []
+    feature_input = hourly_df.merge(
+        removal_predictions[["StudyID", "RemovalHour"]], on="StudyID", how="left"
+    )
 
-    patient_flow = generate_flow(row)
+    for hour in sorted(feature_input["Hour"].dropna().unique()):
+        hour_frame = feature_input[feature_input["Hour"] == hour].copy()
+        if hour_frame.empty:
+            continue
+        hour_frame["RemovedSoon"] = (
+            hour_frame["RemovalHour"].notna()
+            & hour_frame["RemovalHour"].between(hour, hour + next_n_hours)
+        )
+        for feature in feature_cols:
+            values = hour_frame[feature].astype(float)
+            target = hour_frame["RemovedSoon"].astype(int)
+            if values.notna().sum() < 2 or target.sum() < 2 or target.sum() == len(target):
+                continue
+            try:
+                auc = roc_auc_score(target, values)
+            except ValueError:
+                auc = np.nan
+            auc_rows.append({"Hour": hour, "Feature": feature, "AUC": auc})
 
-    all_flow.append(patient_flow)
+    return pd.DataFrame(auc_rows)
 
-flow = pd.concat(all_flow, ignore_index=True)
 
-flow = flow.sort_values(
-    by=["StudyID", "Timestamp"]
-)
+def plot_summary_and_auc(summary_stats, auc_over_time, output_file="summary_auc_analysis.png"):
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
-# Load CXR data for removal analysis
-from tableCXR import cxr
+    if not auc_over_time.empty:
+        for feature, group in auc_over_time.groupby("Feature"):
+            axes[0].plot(group["Hour"], group["AUC"], marker="o", linewidth=2, label=feature)
+        axes[0].axvline(27, color="green", linestyle="--", alpha=0.7, label="Hour 27")
+        axes[0].axvline(30, color="red", linestyle="--", alpha=0.7, label="Hour 30")
+        axes[0].axhline(0.5, color="gray", linestyle=":", alpha=0.5)
+        axes[0].set_xlabel("Hours After Surgery")
+        axes[0].set_ylabel("AUC")
+        axes[0].set_title("Separation (AUC) Over Time")
+        axes[0].set_ylim([0, 1])
+        axes[0].grid(alpha=0.3)
+        axes[0].legend()
 
-# =============================================================================
-# GENERATE REMOVAL PREDICTIONS (HOURLY WITH FULL ANALYSIS)
-# =============================================================================
+    if not summary_stats.empty:
+        air_leak = summary_stats[summary_stats["Feature"] == "AirLeakFlow"]
+        for group_name, group in air_leak.groupby("Group"):
+            axes[1].plot(group["Hour"], group["Mean"], marker="o", linewidth=2, label=f"{group_name} (mean)")
+            axes[1].fill_between(
+                group["Hour"],
+                group["Mean"] - group["Std"],
+                group["Mean"] + group["Std"],
+                alpha=0.15,
+            )
+        axes[1].set_xlabel("Hours After Surgery")
+        axes[1].set_ylabel("AirLeakFlow")
+        axes[1].set_title("AirLeakFlow: Removed vs Not Removed")
+        axes[1].grid(alpha=0.3)
+        axes[1].legend()
 
-print("\n" + "="*80)
-print("REMOVAL READINESS ANALYSIS (HOURLY)")
-print("="*80)
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
 
-removal_predictions, hourly_removals = predict_removals_hourly(flow, cxr, manifest)
 
-print(f"\nTotal patients: {len(removal_predictions)}")
-print(f"Removed: {removal_predictions['Removed'].sum()}")
-print(f"Not removed: {(~removal_predictions['Removed']).sum()}")
-print(f"Overall removal rate: {removal_predictions['Removed'].mean():.2%}")
+def save_flow_table(flow, filename="flow_output.tab"):
+    flow.to_csv(filename, sep="\t", index=False)
 
-# Removal rate by profile
-print("\nRemoval rates by patient profile:")
-profile_stats = removal_predictions.groupby('Profile').agg({
-    'Removed': ['sum', 'count', 'mean']
-}).round(3)
-print(profile_stats)
 
-# Find non-removable patients (120+ hours)
-long_stay = removal_predictions[removal_predictions['DurationHours'] >= 120]
-not_removed_long_stay = long_stay[~long_stay['Removed']]
-print(f"\nPatients with 120+ hour stays: {len(long_stay)}")
-print(f"Not removed (120+ hours): {len(not_removed_long_stay)}")
+def main(num_patients=None):
+    manifest_data, cxr_data = generate_synthetic_data(num_patients)
 
-if len(not_removed_long_stay) > 0:
-    print("\nNon-removable patients (120+ hours):")
-    print(not_removed_long_stay[['StudyID', 'DurationHours', 'Profile', 'RemovalProbability']].head(10))
+    flow = build_flow_table(manifest_data)
+    removal_predictions, hourly_removals = predict_removals_hourly(flow, cxr_data, manifest_data)
 
-# Plot analysis
-plot_removal_metrics(removal_predictions, hourly_removals, output_file='removal_analysis.png')
+    plot_removal_metrics(removal_predictions, hourly_removals)
 
-print("\n" + "="*80)
-print("HOURLY REMOVAL DECISIONS")
-print("="*80)
-print(f"Total hourly decisions: {len(hourly_removals)}")
-print(f"Removals by hour (first 50 hours):")
-hourly_summary = hourly_removals[hourly_removals['Hour'] <= 50].groupby('Hour').agg({
-    'RemovalDecision': 'sum',
-    'MeetsFlowCriteria': 'sum',
-    'CXRValid': 'sum',
-    'RemovalProbability': 'mean'
-}).round(3)
-print(hourly_summary)
+    flow_with_time = add_time_since_surgery(flow, manifest_data, "Timestamp")
+    cxr_with_time = add_time_since_surgery(cxr_data, manifest_data, "EventDate")
 
-# =============================================================================
-# OUTPUT OPTIONS
-# =============================================================================
+    ct = removal_predictions[["StudyID", "HoursUntilRemoval"]].rename(columns={"HoursUntilRemoval": "TOptimal"})
+    ct.to_csv("ct.csv", index=False)
 
-flow["Timestamp"] = flow["Timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+    summary_stats = build_hourly_feature_summary(flow_with_time, removal_predictions)
+    summary_stats.to_csv("hourly_feature_summary.csv", index=False)
 
-print("\n" + "="*80)
-print("FLOW DATA OUTPUT")
-print("="*80 + "\n")
+    auc_over_time = build_auc_over_time(hourly_removals, removal_predictions)
+    auc_over_time.to_csv("auc_over_time.csv", index=False)
 
-output_choice = input("Output FLOW table to a file? (yes/no): ")
+    plot_summary_and_auc(summary_stats, auc_over_time)
 
-if output_choice == "yes":
-    filename = input("Enter filename (e.g. flow_output.tab): ").strip()
-    if not filename:
-        filename = "flow_output.tab"
-    with open(filename, "w") as f:
-        f.write("\t".join(flow.columns) + "\n")
-        for _, r in flow.iterrows():
-            line = f"{r['StudyID']}\t{r['Timestamp']}\t{r['MeasuredPleuralPressure']}\t\t\t{r['AirLeakFlow']}\t\t\t{r['LOWESSFluidOutput']}\n"
-            f.write(line)
-    print(f"FLOW table saved to {filename}")
-else:
-    print(flow.to_string(index=False))
+    force_no_removal_count = int(removal_predictions["ForceNoRemoval"].sum())
+    pd.DataFrame({"ForceNoRemovalCount": [force_no_removal_count]}).to_csv("force_no_removal_report.csv", index=False)
 
-# Output removal predictions
-output_removals = input("\nSave removal predictions to CSV? (yes/no): ")
-if output_removals == "yes":
-    removal_predictions.to_csv('removal_predictions.csv', index=False)
-    print("Removal predictions saved to removal_predictions.csv")
-    
-    # Also save hourly removals for detailed analysis
-    hourly_removals.to_csv('hourly_removal_decisions.csv', index=False)
-    print("Hourly removal decisions saved to hourly_removal_decisions.csv")
+    flow_with_time["Timestamp"] = flow_with_time["Timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+    cxr_with_time["EventDate"] = cxr_with_time["EventDate"].dt.strftime("%Y-%m-%d %H:%M")
+
+    save_flow_table(flow_with_time, "flow_output.tab")
+    removal_predictions.to_csv("removal_predictions.csv", index=False)
+    hourly_removals.to_csv("hourly_removal_decisions.csv", index=False)
+    cxr_with_time.to_csv("cxr_output.csv", index=False)
+
+print("done")
+if __name__ == "__main__":
+    main()
