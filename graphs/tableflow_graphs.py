@@ -39,7 +39,10 @@ def plot_removal_metrics(removal_df, hourly_df, output_file="removal_analysis.pn
     axes[0, 1].set_title("Distribution of Removal Probabilities")
     axes[0, 1].grid(axis="y", alpha=0.3)
 
-    removal_counts = removal_df["Removed"].value_counts()
+    # value_counts() sorts by count, not by True/False -- pin the order
+    # explicitly so it always lines up with the "Not Removed"/"Removed"
+    # labels below regardless of which outcome happens to be more common.
+    removal_counts = removal_df["Removed"].value_counts().reindex([False, True], fill_value=0)
     axes[0, 2].pie(
         removal_counts.values,
         labels=["Not Removed", "Removed"],
