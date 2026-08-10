@@ -1,3 +1,10 @@
+from pathlib import Path
+import sys
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -12,6 +19,7 @@ from tableflow import (
 )
 
 
+# Create a multi-panel chart showing patient removal trends, probability distribution, and outcome summaries.
 def plot_removal_metrics(removal_df, hourly_df, output_file="removal_analysis.png"):
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
@@ -76,6 +84,7 @@ def plot_removal_metrics(removal_df, hourly_df, output_file="removal_analysis.pn
     plt.close()
 
 
+# Plot how predictive performance and air-leak summary values change over time for removed vs. non-removed patients.
 def plot_summary_and_auc(summary_stats, auc_over_time, output_file="summary_auc_analysis.png"):
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
@@ -113,17 +122,23 @@ def plot_summary_and_auc(summary_stats, auc_over_time, output_file="summary_auc_
     plt.close()
 
 
-def generate_graph_outputs(num_patients=None, output_dir="."):
+# Generate the synthetic data, build the relevant tables, and save all graph outputs in a target directory.
+def generate_graph_outputs(num_patients=None, output_dir=None):
+    if output_dir is None:
+        output_dir = Path(__file__).resolve().parent
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     manifest_data, cxr_data = generate_synthetic_data(num_patients)
     flow = build_flow_table(manifest_data)
     removal_predictions, hourly_removals = predict_removals_hourly(flow, cxr_data, manifest_data)
 
-    plot_removal_metrics(removal_predictions, hourly_removals, f"{output_dir}/removal_analysis.png")
+    plot_removal_metrics(removal_predictions, hourly_removals, output_dir / "removal_analysis.png")
 
     flow_with_time = add_time_since_surgery(flow, manifest_data, "Timestamp")
     summary_stats = build_hourly_feature_summary(flow_with_time, removal_predictions)
     auc_over_time = build_auc_over_time(hourly_removals, removal_predictions)
-    plot_summary_and_auc(summary_stats, auc_over_time, f"{output_dir}/summary_auc_analysis.png")
+    plot_summary_and_auc(summary_stats, auc_over_time, output_dir / "summary_auc_analysis.png")
 
     return {
         "manifest": manifest_data,
@@ -136,6 +151,7 @@ def generate_graph_outputs(num_patients=None, output_dir="."):
     }
 
 
+# Run the graph-generation workflow from the command line.
 def main(num_patients=None):
     generate_graph_outputs(num_patients=num_patients)
 

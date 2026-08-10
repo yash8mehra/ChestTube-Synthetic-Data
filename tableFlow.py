@@ -5,6 +5,13 @@ from sklearn.metrics import roc_auc_score
 GRADES = ["Z", "O", "T", "Th"]
 
 
+def round_numeric_columns(df):
+    if isinstance(df, pd.DataFrame):
+        return df.apply(lambda col: col.round(3) if pd.api.types.is_numeric_dtype(col) else col)
+    return round(df, 3)
+
+
+# Create a synthetic patient manifest with surgery timing and duration information.
 def make_manifest(num_patients=None):
     if num_patients is None:
         num_patients = 100
@@ -28,6 +35,7 @@ def make_manifest(num_patients=None):
     })
 
 
+# Generate chest X-ray events over the course of each patient's recovery window.
 def generate_cxr(manifest_data):
     all_cxr = []
 
@@ -63,17 +71,20 @@ def generate_cxr(manifest_data):
     return cxr
 
 
+# Produce the full synthetic dataset for the study: patient metadata and imaging timing.
 def generate_synthetic_data(num_patients=None):
     manifest_data = make_manifest(num_patients)
     cxr_data = generate_cxr(manifest_data)
     return manifest_data, cxr_data
 
 
+# Build the timestamp grid for a patient's chest tube monitoring period.
 def make_timestamps(start, duration_hours):
     end = start + pd.Timedelta(hours=duration_hours)
     return pd.date_range(start=start, end=end, freq="10min")
 
 
+# Simulate changing baseline air leak and fluid output rates over time.
 def sample_segment_rates(n):
     air_base = np.zeros(n)
     fluid_base = np.zeros(n)
@@ -99,28 +110,32 @@ def sample_segment_rates(n):
     return air_base, fluid_base
 
 
+# Convert the air leak baseline into realistic measured values with occasional spikes.
 def make_air_leak(air_base):
     n = len(air_base)
     air_leak = air_base * np.abs(np.random.normal(1.0, 0.4, size=n))
     spike_mask = np.random.random(n) < 0.03
     air_leak[spike_mask] += np.random.exponential(scale=150, size=spike_mask.sum())
-    return np.clip(np.round(air_leak, 2), 0, 1000)
+    return np.clip(np.round(air_leak, 3), 0, 1000)
 
 
+# Create noisy fluid output measurements from the underlying tissue drainage trend.
 def make_fluid_output(fluid_base):
     noise = np.random.normal(0, fluid_base * 0.25 + 0.5, size=fluid_base.shape)
     fluid_output = np.round(fluid_base + noise).astype(int)
     return np.clip(fluid_output, 0, 500)
 
 
+# Simulate pleural pressure with mild drift and random measurement noise.
 def make_pressure(n):
     target = np.random.uniform(-1.5, 0.5)
     drift = np.cumsum(np.random.normal(0, 0.01, size=n))
     noise = np.random.normal(0, 0.08, size=n)
     pressure = target + drift + noise
-    return np.clip(np.round(pressure, 2), -3.0, 1.5)
+    return np.clip(np.round(pressure, 3), -3.0, 1.5)
 
 
+# Produce one patient's full chest tube flow time series from the study metadata.
 def generate_flow(row):
     studyid = row["StudyID"]
     start = row["SurgeryStart"]
@@ -143,6 +158,7 @@ def generate_flow(row):
     })
 
 
+# Label each patient as mild, moderate, or severe using early post-surgery flow behavior.
 def classify_patient_profile(patient_flow, start_time):
     window = patient_flow[
         (patient_flow["Timestamp"] >= start_time) &
@@ -162,6 +178,7 @@ def classify_patient_profile(patient_flow, start_time):
     return "MILD"
 
 
+# Check whether the most recent chest X-ray supports removal at a given time.
 def validate_cxr_for_removal(patient_cxr, removal_time):
     if patient_cxr.empty:
         return True
@@ -181,6 +198,7 @@ def validate_cxr_for_removal(patient_cxr, removal_time):
     )
 
 
+# Summarize the last 8 hours of flow data into the metrics used for removal criteria.
 def normalized_flow_limits(window_data):
     air_max = window_data["AirLeakFlow"].max()
     fluid_rate = window_data["LOWESSFluidOutput"].max() / 10.0
@@ -190,6 +208,7 @@ def normalized_flow_limits(window_data):
     return air_max, fluid_rate, pressure_mean, pressure_ok, air_max <= 10.0 and fluid_rate <= 3.0 and pressure_ok
 
 
+# Return a base probability of removal at a given postoperative hour.
 def hourly_removal_probability(hour):
     if hour < 12:
         return 0.0
@@ -198,6 +217,7 @@ def hourly_removal_probability(hour):
     return 0.0
 
 
+# Estimate hourly chest tube removal decisions across all patients using flow and imaging rules.
 def predict_removals_hourly(flow, cxr_data, manifest_data):
     records = []
     hourly = []
@@ -278,12 +298,14 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
     return pd.DataFrame(records), pd.DataFrame(hourly)
 
 
+# Combine all generated per-patient flow tables into one study-wide data table.
 def build_flow_table(manifest_data):
     return pd.concat([generate_flow(row) for _, row in manifest_data.iterrows()], ignore_index=True).sort_values(
         by=["StudyID", "Timestamp"]
     )
 
 
+# Add hours-since-surgery to a dataframe based on each patient’s surgery start time.
 def add_time_since_surgery(dataframe, manifest_data, timestamp_column):
     result = dataframe.copy()
     result = result.merge(manifest_data[["StudyID", "SurgeryStart"]], on="StudyID", how="left")
@@ -293,6 +315,7 @@ def add_time_since_surgery(dataframe, manifest_data, timestamp_column):
     return result.drop(columns=["SurgeryStart"])
 
 
+# Summarize hourly feature averages and variability for removed versus non-removed groups.
 def build_hourly_feature_summary(flow_with_time, removal_predictions):
     feature_cols = ["AirLeakFlow", "LOWESSFluidOutput", "MeasuredPleuralPressure"]
     summary_input = flow_with_time.merge(
@@ -311,9 +334,10 @@ def build_hourly_feature_summary(flow_with_time, removal_predictions):
         long_summary.groupby(["Hour", "Feature", "Group"], as_index=False)["Value"]
         .agg(Mean="mean", Std="std")
     )
-    return summary_stats
+    return round_numeric_columns(summary_stats)
 
 
+# Compute AUC over time to see how well each feature separates near-term removals.
 def build_auc_over_time(hourly_df, removal_predictions, next_n_hours=24):
     feature_cols = ["AirLeakFlow_Max_8h", "FluidOutput_Max_PerMin_8h"]
     auc_rows = []
@@ -340,13 +364,16 @@ def build_auc_over_time(hourly_df, removal_predictions, next_n_hours=24):
                 auc = np.nan
             auc_rows.append({"Hour": hour, "Feature": feature, "AUC": auc})
 
-    return pd.DataFrame(auc_rows)
+    return round_numeric_columns(pd.DataFrame(auc_rows))
 
 
+# Save the flow table in a tab-separated format for downstream use.
 def save_flow_table(flow, filename="flow_output.tab"):
+    flow = round_numeric_columns(flow)
     flow.to_csv(filename, sep="\t", index=False)
 
 
+# Export the full set of study tables and summary files to a target directory.
 def export_csv_outputs(num_patients=None, output_dir="."):
     manifest_data, cxr_data = generate_synthetic_data(num_patients)
 
@@ -357,6 +384,7 @@ def export_csv_outputs(num_patients=None, output_dir="."):
     cxr_with_time = add_time_since_surgery(cxr_data, manifest_data, "EventDate")
 
     ct = removal_predictions[["StudyID", "HoursUntilRemoval"]].rename(columns={"HoursUntilRemoval": "TOptimal"})
+    ct = round_numeric_columns(ct)
     ct.to_csv(f"{output_dir}/ct.csv", index=False)
 
     summary_stats = build_hourly_feature_summary(flow_with_time, removal_predictions)
@@ -371,7 +399,9 @@ def export_csv_outputs(num_patients=None, output_dir="."):
     flow_with_time["Timestamp"] = flow_with_time["Timestamp"].dt.strftime("%Y-%m-%d %H:%M")
     cxr_with_time["EventDate"] = cxr_with_time["EventDate"].dt.strftime("%Y-%m-%d %H:%M")
 
-    save_flow_table(flow_with_time, f"{output_dir}/flow_output.tab")
+    save_flow_table(round_numeric_columns(flow_with_time), f"{output_dir}/flow_output.tab")
+    removal_predictions = round_numeric_columns(removal_predictions)
+    hourly_removals = round_numeric_columns(hourly_removals)
     removal_predictions.to_csv(f"{output_dir}/removal_predictions.csv", index=False)
     hourly_removals.to_csv(f"{output_dir}/hourly_removal_decisions.csv", index=False)
     cxr_with_time.to_csv(f"{output_dir}/cxr_output.csv", index=False)
@@ -389,6 +419,7 @@ def export_csv_outputs(num_patients=None, output_dir="."):
     }
 
 
+# Run the full export workflow for the synthetic chest tube dataset.
 def main(num_patients=None):
     export_csv_outputs(num_patients=num_patients)
     print("done")
