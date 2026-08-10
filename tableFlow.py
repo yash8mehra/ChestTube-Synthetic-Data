@@ -172,10 +172,10 @@ def make_air_leak(air_base):
     return np.clip(np.round(air_leak, 3), 0, 6000)
 
 
-# Create cumulative fluid output with realistic short-term dips instead of
-# forcing a strictly non-decreasing series. The underlying trend is still
-# increasing overall, but real hospital measurements show occasional decreases
-# due to noise and smoothing artifacts.
+# Create cumulative fluid output with local, one-time dips rather than a
+# permanently compounding baseline shift. The overall trend remains upward,
+# but the real data includes short decreases due to measurement noise and
+# smoothing artifacts.
 def make_fluid_output(fluid_base):
     noise = np.random.normal(0, fluid_base * 0.5 + 0.2, size=fluid_base.shape)
     incremental_flow = np.clip(fluid_base + noise, 0.0, None)
@@ -183,9 +183,11 @@ def make_fluid_output(fluid_base):
 
     dip_mask = np.random.random(cumulative_flow.shape) < 0.08
     if np.any(dip_mask):
-        downward_adjustments = np.zeros_like(cumulative_flow)
-        downward_adjustments[dip_mask] = -np.random.uniform(3.0, 35.0, size=np.sum(dip_mask))
-        cumulative_flow = cumulative_flow + np.cumsum(downward_adjustments)
+        dip_idx = np.flatnonzero(dip_mask)
+        for idx in dip_idx:
+            local_drop = np.random.uniform(3.0, 35.0)
+            if idx + 1 < len(cumulative_flow):
+                cumulative_flow[idx + 1:] = cumulative_flow[idx + 1:] - local_drop
 
     return np.clip(np.round(cumulative_flow, 3), 0, 5000)
 
@@ -317,14 +319,11 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
         removal_probability_final = 0.0
 
         t_optimal = patient["TOptimal"]
-        if pd.notna(t_optimal) and int(t_optimal) <= int(duration_hours) and not force_no_removal:
-            removal_hour = int(t_optimal)
-            removal_time = start_time + pd.Timedelta(hours=removal_hour)
-            removal_probability_final = hourly_removal_probability(removal_hour)
+        candidate_start = int(t_optimal) if pd.notna(t_optimal) else None
+        if candidate_start is not None and candidate_start <= int(duration_hours) and not force_no_removal:
+            candidate_range = range(candidate_start, int(duration_hours) + 1)
         else:
-            removal_hour = None
-            removal_time = None
-            removal_probability_final = 0.0
+            candidate_range = []
 
         for hour in range(1, int(duration_hours) + 1):
             hour_end = start_time + pd.Timedelta(hours=hour)
@@ -343,7 +342,13 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
             if meets_criteria:
                 cxr_valid = validate_cxr_for_removal(patient_cxr, hour_end)
 
-            removal_decision = bool(hour == removal_hour and not force_no_removal)
+            removal_candidate = hour in candidate_range and meets_criteria and cxr_valid and not force_no_removal
+            if removal_candidate and removal_hour is None:
+                removal_hour = hour
+                removal_time = hour_end
+                removal_probability_final = prob
+
+            removal_decision = bool(hour == removal_hour and meets_criteria and cxr_valid and not force_no_removal)
 
             hourly.append({
                 "StudyID": studyid,
@@ -371,7 +376,7 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
             "RemovalProbability": removal_probability_final,
             "HoursUntilRemoval": removal_hour if removal_hour else None,
             "ForceNoRemoval": force_no_removal,
-            "TOptimal": t_optimal if pd.notna(t_optimal) else None,
+            "TOptimal": t_optimal if (removal_time is not None) else None,
         })
 
     return pd.DataFrame(records), pd.DataFrame(hourly)
@@ -465,10 +470,16 @@ def export_csv_outputs(num_patients=None, output_dir="."):
 
 
 # Run the full export workflow for the synthetic chest tube dataset.
-def main(num_patients=None, seed=DEFAULT_SEED):
-    np.random.seed(seed)
+# Normal runs are stochastic and use fresh randomness unless a seed is supplied
+# explicitly, e.g. `main(seed=20240601)` for reproducible output.
+def main(num_patients=None, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
     export_csv_outputs(num_patients=num_patients)
-    print(f"done (seed={seed})")
+    if seed is None:
+        print("done")
+    else:
+        print(f"done (seed={seed})")
 
 
 if __name__ == "__main__":
