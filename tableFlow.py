@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
 
 GRADES = ["Z", "O", "T", "TH"]
 
@@ -382,36 +381,6 @@ def build_hourly_feature_summary(flow_with_time, removal_predictions):
     return round_numeric_columns(summary_stats)
 
 
-# Compute AUC over time to see how well each feature separates near-term removals.
-def build_auc_over_time(hourly_df, removal_predictions, next_n_hours=24):
-    feature_cols = ["AirLeakFlow_Max_8h", "FluidOutput_Max_PerMin_8h"]
-    auc_rows = []
-    feature_input = hourly_df.merge(
-        removal_predictions[["StudyID", "RemovalHour"]], on="StudyID", how="left"
-    )
-
-    for hour in sorted(feature_input["Hour"].dropna().unique()):
-        hour_frame = feature_input[feature_input["Hour"] == hour].copy()
-        if hour_frame.empty:
-            continue
-        hour_frame["RemovedSoon"] = (
-            hour_frame["RemovalHour"].notna()
-            & hour_frame["RemovalHour"].between(hour, hour + next_n_hours)
-        )
-        for feature in feature_cols:
-            values = hour_frame[feature].astype(float)
-            target = hour_frame["RemovedSoon"].astype(int)
-            if values.notna().sum() < 2 or target.sum() < 2 or target.sum() == len(target):
-                continue
-            try:
-                auc = roc_auc_score(target, values)
-            except ValueError:
-                auc = np.nan
-            auc_rows.append({"Hour": hour, "Feature": feature, "AUC": auc})
-
-    return round_numeric_columns(pd.DataFrame(auc_rows))
-
-
 # Save the flow table in a tab-separated format for downstream use.
 def save_flow_table(flow, filename="flow_output.tab"):
     flow = round_numeric_columns(flow)
@@ -435,9 +404,6 @@ def export_csv_outputs(num_patients=None, output_dir="."):
     summary_stats = build_hourly_feature_summary(flow_with_time, removal_predictions)
     summary_stats.to_csv(f"{output_dir}/hourly_feature_summary.csv", index=False)
 
-    auc_over_time = build_auc_over_time(hourly_removals, removal_predictions)
-    auc_over_time.to_csv(f"{output_dir}/auc_over_time.csv", index=False)
-
     force_no_removal_count = int(removal_predictions["ForceNoRemoval"].sum())
     pd.DataFrame({"ForceNoRemovalCount": [force_no_removal_count]}).to_csv(f"{output_dir}/force_no_removal_report.csv", index=False)
 
@@ -460,7 +426,6 @@ def export_csv_outputs(num_patients=None, output_dir="."):
         "flow_with_time": flow_with_time,
         "cxr_with_time": cxr_with_time,
         "summary_stats": summary_stats,
-        "auc_over_time": auc_over_time,
     }
 
 

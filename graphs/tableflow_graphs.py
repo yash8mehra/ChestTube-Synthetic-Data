@@ -9,9 +9,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from tableflow import (
+from tableFlow import (
     add_time_since_surgery,
-    build_auc_over_time,
     build_flow_table,
     build_hourly_feature_summary,
     generate_synthetic_data,
@@ -84,38 +83,25 @@ def plot_removal_metrics(removal_df, hourly_df, output_file="removal_analysis.pn
     plt.close()
 
 
-# Plot how predictive performance and air-leak summary values change over time for removed vs. non-removed patients.
-def plot_summary_and_auc(summary_stats, auc_over_time, output_file="summary_auc_analysis.png"):
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-    if not auc_over_time.empty:
-        for feature, group in auc_over_time.groupby("Feature"):
-            axes[0].plot(group["Hour"], group["AUC"], marker="o", linewidth=2, label=feature)
-        axes[0].axvline(27, color="green", linestyle="--", alpha=0.7, label="Hour 27")
-        axes[0].axvline(30, color="red", linestyle="--", alpha=0.7, label="Hour 30")
-        axes[0].axhline(0.5, color="gray", linestyle=":", alpha=0.5)
-        axes[0].set_xlabel("Hours After Surgery")
-        axes[0].set_ylabel("AUC")
-        axes[0].set_title("Separation (AUC) Over Time")
-        axes[0].set_ylim([0, 1])
-        axes[0].grid(alpha=0.3)
-        axes[0].legend()
+# Plot hourly air-leak summary values for removed vs. non-removed patients.
+def plot_summary_stats(summary_stats, output_file="summary_feature_analysis.png"):
+    fig, axes = plt.subplots(1, 1, figsize=(12, 6))
 
     if not summary_stats.empty:
         air_leak = summary_stats[summary_stats["Feature"] == "AirLeakFlow"]
         for group_name, group in air_leak.groupby("Group"):
-            axes[1].plot(group["Hour"], group["Mean"], marker="o", linewidth=2, label=f"{group_name} (mean)")
-            axes[1].fill_between(
+            axes.plot(group["Hour"], group["Mean"], marker="o", linewidth=2, label=f"{group_name} (mean)")
+            axes.fill_between(
                 group["Hour"],
                 group["Mean"] - group["Std"],
                 group["Mean"] + group["Std"],
                 alpha=0.15,
             )
-        axes[1].set_xlabel("Hours After Surgery")
-        axes[1].set_ylabel("AirLeakFlow")
-        axes[1].set_title("AirLeakFlow: Removed vs Not Removed")
-        axes[1].grid(alpha=0.3)
-        axes[1].legend()
+        axes.set_xlabel("Hours After Surgery")
+        axes.set_ylabel("AirLeakFlow")
+        axes.set_title("AirLeakFlow: Removed vs Not Removed")
+        axes.grid(alpha=0.3)
+        axes.legend()
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches="tight")
@@ -137,8 +123,7 @@ def generate_graph_outputs(num_patients=None, output_dir=None):
 
     flow_with_time = add_time_since_surgery(flow, manifest_data, "Timestamp")
     summary_stats = build_hourly_feature_summary(flow_with_time, removal_predictions)
-    auc_over_time = build_auc_over_time(hourly_removals, removal_predictions)
-    plot_summary_and_auc(summary_stats, auc_over_time, output_dir / "summary_auc_analysis.png")
+    plot_summary_stats(summary_stats, output_dir / "summary_feature_analysis.png")
 
     return {
         "manifest": manifest_data,
@@ -147,7 +132,6 @@ def generate_graph_outputs(num_patients=None, output_dir=None):
         "removal_predictions": removal_predictions,
         "hourly_removals": hourly_removals,
         "summary_stats": summary_stats,
-        "auc_over_time": auc_over_time,
     }
 
 
