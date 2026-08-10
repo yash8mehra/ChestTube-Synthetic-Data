@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 GRADES = ["Z", "O", "T", "TH"]
+DEFAULT_SEED = 20240601
 
 # Grade probabilities per finding, calibrated to the real sample's skew toward
 # low-severity readings (Effusion in particular is ~94% "Z" in the real data).
@@ -18,7 +19,31 @@ def round_numeric_columns(df):
     return round(df, 3)
 
 
-# Create a synthetic patient manifest with surgery timing and duration information.
+def sample_t_optimal(num_patients):
+    values = np.full(num_patients, 24, dtype=int)
+    exact_count = int(round(num_patients * 0.62))
+    exact_count = min(max(exact_count, 1), num_patients)
+    tail_count = num_patients - exact_count
+
+    tail_idx = np.random.choice(num_patients, size=tail_count, replace=False)
+    tail = np.random.lognormal(mean=np.log(80), sigma=1.0, size=tail_count)
+    tail = np.clip(np.round(tail), 21, 412).astype(int)
+
+    long_tail_mask = np.random.random(tail_count) < 0.08
+    if np.any(long_tail_mask):
+        tail[long_tail_mask] = np.clip(
+            np.random.uniform(180, 412, size=np.sum(long_tail_mask)).round().astype(int),
+            180,
+            412,
+        )
+
+    values[tail_idx] = tail
+    return np.clip(values, 21, 412)
+
+
+# Create a synthetic patient manifest with surgery timing, duration information,
+# and a direct TOptimal removal-time distribution calibrated to the professor's
+# real sample: 62% removed at ~24h, all others drawn from a long-tail shape.
 def make_manifest(num_patients=None):
     if num_patients is None:
         num_patients = 100
@@ -29,20 +54,22 @@ def make_manifest(num_patients=None):
     surgery_starts = pd.Series(surgery_starts).reset_index(drop=True)
     surgery_type = np.random.choice(["VATS", "Open"], size=num_patients, p=[0.7, 0.3])
 
-    # Lognormal core (median ~38-40hrs, matches real median ~44hrs) plus an
-    # explicit long-stay tail out to ~420hrs to match the real data's outliers,
-    # instead of a uniform range that shifts the whole median upward.
     base_duration = np.random.lognormal(mean=np.log(38), sigma=0.62, size=num_patients)
     duration_hours = np.clip(base_duration, 16, 220)
     long_stay_count = min(max(1, round(num_patients * 0.07)), num_patients)
     long_stay_idx = np.random.choice(num_patients, size=long_stay_count, replace=False)
     duration_hours[long_stay_idx] = np.random.uniform(220, 420, size=long_stay_count)
 
+    t_optimal = sample_t_optimal(num_patients)
+    duration_hours = duration_hours.astype(int)
+    t_optimal = np.minimum(t_optimal, duration_hours)
+
     return pd.DataFrame({
         "StudyID": study_ids,
         "SurgeryStart": surgery_starts,
-        "DurationHours": duration_hours.astype(int),
+        "DurationHours": duration_hours,
         "SurgeryType": surgery_type,
+        "TOptimal": t_optimal,
     })
 
 
@@ -90,9 +117,11 @@ def generate_synthetic_data(num_patients=None):
 
 
 # Build the timestamp grid for a patient's chest tube monitoring period.
+# Use an exclusive end so a 24-hour stay produces 144 ten-minute observations
+# rather than the off-by-one 145-point series from an inclusive boundary.
 def make_timestamps(start, duration_hours):
     end = start + pd.Timedelta(hours=duration_hours)
-    return pd.date_range(start=start, end=end, freq="10min")
+    return pd.date_range(start=start, end=end - pd.Timedelta(minutes=10), freq="10min")
 
 
 # Simulate changing baseline air leak and fluid output rates over time.
@@ -143,26 +172,32 @@ def make_air_leak(air_base):
     return np.clip(np.round(air_leak, 3), 0, 6000)
 
 
-# Create noisy, CUMULATIVE fluid output measurements from the underlying
-# drainage trend (the real data is a running total per patient, not a
-# per-reading rate).
+# Create cumulative fluid output with realistic short-term dips instead of
+# forcing a strictly non-decreasing series. The underlying trend is still
+# increasing overall, but real hospital measurements show occasional decreases
+# due to noise and smoothing artifacts.
 def make_fluid_output(fluid_base):
     noise = np.random.normal(0, fluid_base * 0.5 + 0.2, size=fluid_base.shape)
     incremental_flow = np.clip(fluid_base + noise, 0.0, None)
     cumulative_flow = np.cumsum(incremental_flow)
-    cumulative_flow = np.maximum.accumulate(cumulative_flow)
+
+    dip_mask = np.random.random(cumulative_flow.shape) < 0.08
+    if np.any(dip_mask):
+        downward_adjustments = np.zeros_like(cumulative_flow)
+        downward_adjustments[dip_mask] = -np.random.uniform(3.0, 35.0, size=np.sum(dip_mask))
+        cumulative_flow = cumulative_flow + np.cumsum(downward_adjustments)
+
     return np.clip(np.round(cumulative_flow, 3), 0, 5000)
 
 
 # Simulate pleural pressure with mild drift and random measurement noise.
 def make_pressure(n):
-    # Real sample is almost entirely positive (mean ~1.25) -- previous version
-    # had the sign flipped relative to the professor's data.
+    # Real sample has a rare negative tail; the 0.0 floor was too strict.
     target = np.random.uniform(0.6, 2.2)
     drift = np.cumsum(np.random.normal(0, 0.01, size=n))
     noise = np.random.normal(0, 0.18, size=n)
     pressure = target + drift + noise
-    return np.clip(np.round(pressure, 3), 0.0, 5.5)
+    return np.clip(np.round(pressure, 3), -0.5, 5.5)
 
 
 # Produce one patient's full chest tube flow time series from the study metadata.
@@ -281,6 +316,16 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
         removal_hour = None
         removal_probability_final = 0.0
 
+        t_optimal = patient["TOptimal"]
+        if pd.notna(t_optimal) and int(t_optimal) <= int(duration_hours) and not force_no_removal:
+            removal_hour = int(t_optimal)
+            removal_time = start_time + pd.Timedelta(hours=removal_hour)
+            removal_probability_final = hourly_removal_probability(removal_hour)
+        else:
+            removal_hour = None
+            removal_time = None
+            removal_probability_final = 0.0
+
         for hour in range(1, int(duration_hours) + 1):
             hour_end = start_time + pd.Timedelta(hours=hour)
             window_data = patient_flow[
@@ -294,24 +339,18 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
             air_max, fluid_rate, pressure_mean, pressure_ok, meets_criteria = normalized_flow_limits(window_data)
             prob = 0.0 if force_no_removal else hourly_removal_probability(hour)
 
-            # CXR is now checked for the whole stay, not just hour <= 72.
             cxr_valid = True
             if meets_criteria:
                 cxr_valid = validate_cxr_for_removal(patient_cxr, hour_end)
 
-            removal_decision = bool(
-                meets_criteria and
-                cxr_valid and
-                not removal_time and
-                np.random.random() < prob
-            )
+            removal_decision = bool(hour == removal_hour and not force_no_removal)
 
             hourly.append({
                 "StudyID": studyid,
                 "Hour": hour,
                 "Timestamp": hour_end,
                 "AirLeakFlow_Max_8h": air_max,
-                "FluidOutput_Max_PerMin_8h": fluid_rate,
+                "FluidOutput_Rate_8h": fluid_rate,
                 "PressureMean_8h": pressure_mean,
                 "PressureOK_8h": pressure_ok,
                 "MeetsFlowCriteria": meets_criteria,
@@ -320,11 +359,6 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
                 "RemovalDecision": removal_decision,
                 "Profile": profile,
             })
-
-            if removal_decision:
-                removal_time = hour_end
-                removal_hour = hour
-                removal_probability_final = prob
 
         records.append({
             "StudyID": studyid,
@@ -337,6 +371,7 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
             "RemovalProbability": removal_probability_final,
             "HoursUntilRemoval": removal_hour if removal_hour else None,
             "ForceNoRemoval": force_no_removal,
+            "TOptimal": t_optimal if pd.notna(t_optimal) else None,
         })
 
     return pd.DataFrame(records), pd.DataFrame(hourly)
@@ -397,7 +432,7 @@ def export_csv_outputs(num_patients=None, output_dir="."):
     flow_with_time = add_time_since_surgery(flow, manifest_data, "Timestamp")
     cxr_with_time = add_time_since_surgery(cxr_data, manifest_data, "EventDate")
 
-    ct = removal_predictions[["StudyID", "HoursUntilRemoval"]].rename(columns={"HoursUntilRemoval": "TOptimal"})
+    ct = removal_predictions[["StudyID", "TOptimal"]].copy()
     ct = round_numeric_columns(ct)
     ct.to_csv(f"{output_dir}/ct.csv", index=False)
 
@@ -430,9 +465,10 @@ def export_csv_outputs(num_patients=None, output_dir="."):
 
 
 # Run the full export workflow for the synthetic chest tube dataset.
-def main(num_patients=None):
+def main(num_patients=None, seed=DEFAULT_SEED):
+    np.random.seed(seed)
     export_csv_outputs(num_patients=num_patients)
-    print("done")
+    print(f"done (seed={seed})")
 
 
 if __name__ == "__main__":
