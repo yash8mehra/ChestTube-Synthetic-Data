@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-GRADES = ["Z", "O", "T", "Th"]
+GRADES = ["Z", "O", "T", "TH"]
 
 
 def round_numeric_columns(df):
@@ -22,10 +22,10 @@ def make_manifest(num_patients=None):
     surgery_starts = pd.Series(surgery_starts).reset_index(drop=True)
     surgery_type = np.random.choice(["VATS", "Open"], size=num_patients, p=[0.7, 0.3])
 
-    duration_hours = np.random.randint(24, 120, size=num_patients)
-    long_stay_count = min(max(1, round(num_patients * 0.1)), num_patients)
+    duration_hours = np.random.randint(24, 180, size=num_patients)
+    long_stay_count = min(max(1, round(num_patients * 0.12)), num_patients)
     long_stay_idx = np.random.choice(num_patients, size=long_stay_count, replace=False)
-    duration_hours[long_stay_idx] = np.random.randint(120, 125, size=long_stay_count)
+    duration_hours[long_stay_idx] = np.random.randint(180, 421, size=long_stay_count)
 
     return pd.DataFrame({
         "StudyID": study_ids,
@@ -95,15 +95,15 @@ def sample_segment_rates(n):
         seg_end = min(i + np.random.randint(readings_per_hour, 2 * readings_per_hour + 1), n)
         progress = i / n
 
-        if progress < 0.083:
-            air_base[i:seg_end] = np.random.uniform(2.0, 5.0)
-            fluid_base[i:seg_end] = np.random.uniform(5, 20)
-        elif progress < 0.333:
-            air_base[i:seg_end] = np.random.uniform(1.0, 2.0)
-            fluid_base[i:seg_end] = np.random.uniform(1, 5)
+        if progress < 0.10:
+            air_base[i:seg_end] = np.random.uniform(40.0, 120.0)
+            fluid_base[i:seg_end] = np.random.uniform(0.8, 4.0)
+        elif progress < 0.35:
+            air_base[i:seg_end] = np.random.uniform(25.0, 80.0)
+            fluid_base[i:seg_end] = np.random.uniform(0.4, 2.0)
         else:
-            air_base[i:seg_end] = np.random.uniform(0.5, 1.0)
-            fluid_base[i:seg_end] = np.random.uniform(0, 1)
+            air_base[i:seg_end] = np.random.uniform(10.0, 35.0)
+            fluid_base[i:seg_end] = np.random.uniform(0.1, 1.0)
 
         i = seg_end
 
@@ -113,26 +113,28 @@ def sample_segment_rates(n):
 # Convert the air leak baseline into realistic measured values with occasional spikes.
 def make_air_leak(air_base):
     n = len(air_base)
-    air_leak = air_base * np.abs(np.random.normal(1.0, 0.4, size=n))
-    spike_mask = np.random.random(n) < 0.03
-    air_leak[spike_mask] += np.random.exponential(scale=150, size=spike_mask.sum())
-    return np.clip(np.round(air_leak, 3), 0, 1000)
+    air_leak = air_base * np.abs(np.random.normal(1.2, 0.9, size=n))
+    spike_mask = np.random.random(n) < 0.10
+    air_leak[spike_mask] += np.random.gamma(shape=2.5, scale=300.0, size=spike_mask.sum())
+    return np.clip(np.round(air_leak, 3), 0, 6000)
 
 
 # Create noisy fluid output measurements from the underlying tissue drainage trend.
 def make_fluid_output(fluid_base):
-    noise = np.random.normal(0, fluid_base * 0.25 + 0.5, size=fluid_base.shape)
-    fluid_output = np.round(fluid_base + noise).astype(int)
-    return np.clip(fluid_output, 0, 500)
+    noise = np.random.normal(0, fluid_base * 0.6 + 0.4, size=fluid_base.shape)
+    incremental_flow = np.clip(fluid_base + noise, 0.0, None)
+    cumulative_flow = np.cumsum(incremental_flow)
+    cumulative_flow = np.maximum.accumulate(cumulative_flow)
+    return np.clip(np.round(cumulative_flow, 3), 0, 5000)
 
 
 # Simulate pleural pressure with mild drift and random measurement noise.
 def make_pressure(n):
-    target = np.random.uniform(-1.5, 0.5)
+    target = np.random.uniform(0.6, 2.2)
     drift = np.cumsum(np.random.normal(0, 0.01, size=n))
-    noise = np.random.normal(0, 0.08, size=n)
+    noise = np.random.normal(0, 0.18, size=n)
     pressure = target + drift + noise
-    return np.clip(np.round(pressure, 3), -3.0, 1.5)
+    return np.clip(np.round(pressure, 3), 0.0, 5.5)
 
 
 # Produce one patient's full chest tube flow time series from the study metadata.
@@ -190,7 +192,7 @@ def validate_cxr_for_removal(patient_cxr, removal_time):
     if before.empty:
         return True
 
-    grade_map = {"Z": 0, "O": 1, "T": 2, "Th": 3}
+    grade_map = {"Z": 0, "O": 1, "T": 2, "TH": 3}
     latest = before.iloc[-1]
     return (
         grade_map.get(latest["Effusion"], 2) <= 1 and
@@ -201,20 +203,27 @@ def validate_cxr_for_removal(patient_cxr, removal_time):
 # Summarize the last 8 hours of flow data into the metrics used for removal criteria.
 def normalized_flow_limits(window_data):
     air_max = window_data["AirLeakFlow"].max()
-    fluid_rate = window_data["LOWESSFluidOutput"].max() / 10.0
+    fluid_rate = window_data["LOWESSFluidOutput"].max() / 100.0
     pressure_mean = window_data["MeasuredPleuralPressure"].mean()
     pressure_min = window_data["MeasuredPleuralPressure"].min()
-    pressure_ok = pressure_mean < 0.0 and pressure_min < 0.0
-    return air_max, fluid_rate, pressure_mean, pressure_ok, air_max <= 10.0 and fluid_rate <= 3.0 and pressure_ok
+    pressure_ok = pressure_mean > 0.0 and pressure_min > 0.0
+    meets_criteria = air_max <= 2000.0 and fluid_rate <= 60.0 and pressure_ok
+    return air_max, fluid_rate, pressure_mean, pressure_ok, meets_criteria
 
 
 # Return a base probability of removal at a given postoperative hour.
 def hourly_removal_probability(hour):
     if hour < 12:
         return 0.0
-    if hour < 120:
-        return 0.05
-    return 0.0
+    if hour < 24:
+        return 0.55
+    if hour < 48:
+        return 0.72
+    if hour < 96:
+        return 0.85
+    if hour < 168:
+        return 0.92
+    return 0.75
 
 
 # Estimate hourly chest tube removal decisions across all patients using flow and imaging rules.
@@ -232,7 +241,7 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
         patient_flow = flow[flow["StudyID"] == studyid]
         patient_cxr = cxr_data[cxr_data["StudyID"] == studyid]
         profile = classify_patient_profile(patient_flow, start_time)
-        force_no_removal = duration_hours >= 120
+        force_no_removal = duration_hours >= 400
 
         removal_time = None
         removal_hour = None
@@ -252,7 +261,7 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
             prob = 0.0 if force_no_removal else hourly_removal_probability(hour)
 
             cxr_valid = True
-            if meets_criteria and hour <= 72:
+            if meets_criteria:
                 cxr_valid = validate_cxr_for_removal(patient_cxr, hour_end)
 
             removal_decision = bool(
