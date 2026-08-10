@@ -1,8 +1,5 @@
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score
 
 GRADES = ["Z", "O", "T", "Th"]
@@ -281,70 +278,6 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
     return pd.DataFrame(records), pd.DataFrame(hourly)
 
 
-def plot_removal_metrics(removal_df, hourly_df, output_file="removal_analysis.png"):
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-
-    if not hourly_df.empty:
-        hourly_decisions = hourly_df.groupby("Hour")["RemovalDecision"].sum()
-        axes[0, 0].plot(hourly_decisions.index, hourly_decisions.values, marker="o", linewidth=2, color="steelblue")
-        axes[0, 0].axvline(27, color="green", linestyle="--", alpha=0.7, label="Hour 27")
-        axes[0, 0].axvline(30, color="red", linestyle="--", alpha=0.7, label="Hour 30")
-        axes[0, 0].set_xlabel("Hours After Surgery")
-        axes[0, 0].set_ylabel("Number of Removals")
-        axes[0, 0].set_title("Chest Tube Removals per Hour")
-        axes[0, 0].grid(alpha=0.3)
-        axes[0, 0].legend()
-
-    axes[0, 1].hist(removal_df["RemovalProbability"], bins=20, color="coral", alpha=0.7, edgecolor="black")
-    axes[0, 1].set_xlabel("Removal Probability")
-    axes[0, 1].set_ylabel("Number of Patients")
-    axes[0, 1].set_title("Distribution of Removal Probabilities")
-    axes[0, 1].grid(axis="y", alpha=0.3)
-
-    removal_counts = removal_df["Removed"].value_counts()
-    axes[0, 2].pie(
-        removal_counts.values,
-        labels=["Not Removed", "Removed"],
-        autopct="%1.1f%%",
-        colors=["#ff9999", "#90ee90"],
-        startangle=90,
-    )
-    axes[0, 2].set_title("Overall Removal Rate")
-
-    if not hourly_df.empty:
-        hourly_prob = hourly_df.groupby("Hour")["RemovalProbability"].mean()
-        axes[1, 0].plot(hourly_prob.index, hourly_prob.values, marker="o", linewidth=2, color="purple", markersize=6)
-        axes[1, 0].axvline(27, color="green", linestyle="--", alpha=0.7, label="Hour 27")
-        axes[1, 0].axvline(30, color="red", linestyle="--", alpha=0.7, label="Hour 30")
-        axes[1, 0].set_xlabel("Hours After Surgery")
-        axes[1, 0].set_ylabel("Average Removal Probability")
-        axes[1, 0].set_title("Removal Probability Trend")
-        axes[1, 0].grid(alpha=0.3)
-        axes[1, 0].legend()
-
-    if "Profile" in removal_df.columns:
-        profile_removal = removal_df.groupby("Profile")["Removed"].agg(["sum", "count"])
-        profile_removal["rate"] = profile_removal["sum"] / profile_removal["count"]
-        axes[1, 1].bar(profile_removal.index, profile_removal["rate"], color=["#ff6b6b", "#ffd93d", "#6bcf7f"], alpha=0.7)
-        axes[1, 1].set_ylabel("Removal Rate")
-        axes[1, 1].set_title("Removal Rate by Patient Profile")
-        axes[1, 1].set_ylim([0, 1])
-        axes[1, 1].grid(axis="y", alpha=0.3)
-        for i, v in enumerate(profile_removal["rate"]):
-            axes[1, 1].text(i, v + 0.02, f"{v:.2%}", ha="center")
-
-    if "ForceNoRemoval" in removal_df.columns:
-        long_stay_counts = removal_df["ForceNoRemoval"].value_counts()
-        axes[1, 2].bar(["<120h", "≥120h"], [long_stay_counts.get(False, 0), long_stay_counts.get(True, 0)], color=["steelblue", "orange"], alpha=0.7)
-        axes[1, 2].set_ylabel("Number of Patients")
-        axes[1, 2].set_title("Patient Stay Duration")
-        axes[1, 2].grid(axis="y", alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches="tight")
-    plt.close()
-
-
 def build_flow_table(manifest_data):
     return pd.concat([generate_flow(row) for _, row in manifest_data.iterrows()], ignore_index=True).sort_values(
         by=["StudyID", "Timestamp"]
@@ -410,80 +343,56 @@ def build_auc_over_time(hourly_df, removal_predictions, next_n_hours=24):
     return pd.DataFrame(auc_rows)
 
 
-def plot_summary_and_auc(summary_stats, auc_over_time, output_file="summary_auc_analysis.png"):
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-    if not auc_over_time.empty:
-        for feature, group in auc_over_time.groupby("Feature"):
-            axes[0].plot(group["Hour"], group["AUC"], marker="o", linewidth=2, label=feature)
-        axes[0].axvline(27, color="green", linestyle="--", alpha=0.7, label="Hour 27")
-        axes[0].axvline(30, color="red", linestyle="--", alpha=0.7, label="Hour 30")
-        axes[0].axhline(0.5, color="gray", linestyle=":", alpha=0.5)
-        axes[0].set_xlabel("Hours After Surgery")
-        axes[0].set_ylabel("AUC")
-        axes[0].set_title("Separation (AUC) Over Time")
-        axes[0].set_ylim([0, 1])
-        axes[0].grid(alpha=0.3)
-        axes[0].legend()
-
-    if not summary_stats.empty:
-        air_leak = summary_stats[summary_stats["Feature"] == "AirLeakFlow"]
-        for group_name, group in air_leak.groupby("Group"):
-            axes[1].plot(group["Hour"], group["Mean"], marker="o", linewidth=2, label=f"{group_name} (mean)")
-            axes[1].fill_between(
-                group["Hour"],
-                group["Mean"] - group["Std"],
-                group["Mean"] + group["Std"],
-                alpha=0.15,
-            )
-        axes[1].set_xlabel("Hours After Surgery")
-        axes[1].set_ylabel("AirLeakFlow")
-        axes[1].set_title("AirLeakFlow: Removed vs Not Removed")
-        axes[1].grid(alpha=0.3)
-        axes[1].legend()
-
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches="tight")
-    plt.close()
-
-
 def save_flow_table(flow, filename="flow_output.tab"):
     flow.to_csv(filename, sep="\t", index=False)
 
 
-def main(num_patients=None):
+def export_csv_outputs(num_patients=None, output_dir="."):
     manifest_data, cxr_data = generate_synthetic_data(num_patients)
 
     flow = build_flow_table(manifest_data)
     removal_predictions, hourly_removals = predict_removals_hourly(flow, cxr_data, manifest_data)
 
-    plot_removal_metrics(removal_predictions, hourly_removals)
-
     flow_with_time = add_time_since_surgery(flow, manifest_data, "Timestamp")
     cxr_with_time = add_time_since_surgery(cxr_data, manifest_data, "EventDate")
 
     ct = removal_predictions[["StudyID", "HoursUntilRemoval"]].rename(columns={"HoursUntilRemoval": "TOptimal"})
-    ct.to_csv("ct.csv", index=False)
+    ct.to_csv(f"{output_dir}/ct.csv", index=False)
 
     summary_stats = build_hourly_feature_summary(flow_with_time, removal_predictions)
-    summary_stats.to_csv("hourly_feature_summary.csv", index=False)
+    summary_stats.to_csv(f"{output_dir}/hourly_feature_summary.csv", index=False)
 
     auc_over_time = build_auc_over_time(hourly_removals, removal_predictions)
-    auc_over_time.to_csv("auc_over_time.csv", index=False)
-
-    plot_summary_and_auc(summary_stats, auc_over_time)
+    auc_over_time.to_csv(f"{output_dir}/auc_over_time.csv", index=False)
 
     force_no_removal_count = int(removal_predictions["ForceNoRemoval"].sum())
-    pd.DataFrame({"ForceNoRemovalCount": [force_no_removal_count]}).to_csv("force_no_removal_report.csv", index=False)
+    pd.DataFrame({"ForceNoRemovalCount": [force_no_removal_count]}).to_csv(f"{output_dir}/force_no_removal_report.csv", index=False)
 
     flow_with_time["Timestamp"] = flow_with_time["Timestamp"].dt.strftime("%Y-%m-%d %H:%M")
     cxr_with_time["EventDate"] = cxr_with_time["EventDate"].dt.strftime("%Y-%m-%d %H:%M")
 
-    save_flow_table(flow_with_time, "flow_output.tab")
-    removal_predictions.to_csv("removal_predictions.csv", index=False)
-    hourly_removals.to_csv("hourly_removal_decisions.csv", index=False)
-    cxr_with_time.to_csv("cxr_output.csv", index=False)
+    save_flow_table(flow_with_time, f"{output_dir}/flow_output.tab")
+    removal_predictions.to_csv(f"{output_dir}/removal_predictions.csv", index=False)
+    hourly_removals.to_csv(f"{output_dir}/hourly_removal_decisions.csv", index=False)
+    cxr_with_time.to_csv(f"{output_dir}/cxr_output.csv", index=False)
 
-print("done")
+    return {
+        "manifest": manifest_data,
+        "cxr": cxr_data,
+        "flow": flow,
+        "removal_predictions": removal_predictions,
+        "hourly_removals": hourly_removals,
+        "flow_with_time": flow_with_time,
+        "cxr_with_time": cxr_with_time,
+        "summary_stats": summary_stats,
+        "auc_over_time": auc_over_time,
+    }
+
+
+def main(num_patients=None):
+    export_csv_outputs(num_patients=num_patients)
+    print("done")
+
+
 if __name__ == "__main__":
     main()
