@@ -180,17 +180,27 @@ def make_air_leak(air_base):
 # Create cumulative fluid output with local, one-time dips rather than a
 # permanently compounding baseline shift. The overall trend remains upward,
 # but the real data includes short decreases due to measurement noise and
-# smoothing artifacts.
+# smoothing artifacts. Real dips are rare (~1.5% of readings) and usually
+# tiny (median magnitude of 1), with only occasional larger drops (up to
+# ~30-35 at the extreme) -- a flat uniform(3, 35) on every dip was both too
+# frequent and too large, which forced early-series values (where the
+# cumulative total is still small) down to 0 far more often than the real
+# data shows.
 def make_fluid_output(fluid_base):
     noise = np.random.normal(0, fluid_base * 0.5 + 0.2, size=fluid_base.shape)
     incremental_flow = np.clip(fluid_base + noise, 0.0, None)
     cumulative_flow = np.cumsum(incremental_flow)
 
-    dip_mask = np.random.random(cumulative_flow.shape) < 0.08
+    dip_mask = np.random.random(cumulative_flow.shape) < 0.015
     if np.any(dip_mask):
         dip_idx = np.flatnonzero(dip_mask)
         for idx in dip_idx:
-            local_drop = np.random.uniform(3.0, 35.0)
+            # Most real dips are a tiny rounding-scale nudge; a minority are
+            # larger smoothing-artifact drops.
+            if np.random.random() < 0.55:
+                local_drop = 1.0
+            else:
+                local_drop = np.random.uniform(2.0, 34.0)
             # Local, one-time dip: only this single reading is pulled down.
             # The next reading resumes from the true cumulative trend instead
             # of carrying the drop forward, so dips don't stack.
@@ -202,7 +212,18 @@ def make_fluid_output(fluid_base):
 # Simulate pleural pressure with mild drift and random measurement noise.
 def make_pressure(n):
     # Real sample has a rare negative tail; the 0.0 floor was too strict.
-    target = np.random.uniform(0.6, 2.2)
+    # Per-patient baseline is right-skewed in the real data (most patients
+    # cluster low, 0.4-1.5, with only a small minority running as high as
+    # 2-4) -- a flat uniform(0.6, 2.2) had no low end and no long tail, which
+    # pushed most readings into 1.5-2.0 instead of the real data's 0.5-1.0.
+    # A small minority of patients (~8%) genuinely run a higher baseline
+    # throughout their stay, which is what puts occasional 2s/3s/4s in the
+    # real data -- without that minority the lognormal body alone doesn't
+    # reach that far.
+    if np.random.random() < 0.08:
+        target = np.random.uniform(2.0, 4.3)
+    else:
+        target = np.random.lognormal(mean=np.log(1.05), sigma=0.32)
     drift = np.cumsum(np.random.normal(0, 0.01, size=n))
     noise = np.random.normal(0, 0.18, size=n)
     pressure = target + drift + noise
