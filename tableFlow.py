@@ -62,7 +62,12 @@ def make_manifest(num_patients=None):
 
     t_optimal = sample_t_optimal(num_patients)
     duration_hours = duration_hours.astype(int)
-    t_optimal = np.minimum(t_optimal, duration_hours)
+    # A patient's monitoring window has to be at least long enough to reach
+    # their own target removal time (plus a short follow-up buffer) -- so
+    # stretch duration_hours up to fit TOptimal instead of truncating
+    # TOptimal down to fit duration_hours. Capping TOptimal here was clipping
+    # away most of the long tail before it ever reached the removal logic.
+    duration_hours = np.maximum(duration_hours, t_optimal + 24)
 
     return pd.DataFrame({
         "StudyID": study_ids,
@@ -186,8 +191,10 @@ def make_fluid_output(fluid_base):
         dip_idx = np.flatnonzero(dip_mask)
         for idx in dip_idx:
             local_drop = np.random.uniform(3.0, 35.0)
-            if idx + 1 < len(cumulative_flow):
-                cumulative_flow[idx + 1:] = cumulative_flow[idx + 1:] - local_drop
+            # Local, one-time dip: only this single reading is pulled down.
+            # The next reading resumes from the true cumulative trend instead
+            # of carrying the drop forward, so dips don't stack.
+            cumulative_flow[idx] = cumulative_flow[idx] - local_drop
 
     return np.clip(np.round(cumulative_flow, 3), 0, 5000)
 
@@ -422,7 +429,7 @@ def build_hourly_feature_summary(flow_with_time, removal_predictions):
 
 
 # Save the flow table in a tab-separated format for downstream use.
-def save_flow_table(flow, filename="flow_output.tab"):
+def save_flow_table(flow, filename="flow_pump_events.tab"):
     flow = round_numeric_columns(flow)
     flow.to_csv(filename, sep="\t", index=False)
 
@@ -439,7 +446,7 @@ def export_csv_outputs(num_patients=None, output_dir="."):
 
     ct = removal_predictions[["StudyID", "TOptimal"]].copy()
     ct = round_numeric_columns(ct)
-    ct.to_csv(f"{output_dir}/ct.csv", index=False)
+    ct.to_csv(f"{output_dir}/ct_removal_time.tab", sep="\t", index=False)
 
     summary_stats = build_hourly_feature_summary(flow_with_time, removal_predictions)
     summary_stats.to_csv(f"{output_dir}/hourly_feature_summary.csv", index=False)
@@ -450,12 +457,19 @@ def export_csv_outputs(num_patients=None, output_dir="."):
     flow_with_time["Timestamp"] = flow_with_time["Timestamp"].dt.strftime("%Y-%m-%d %H:%M")
     cxr_with_time["EventDate"] = cxr_with_time["EventDate"].dt.strftime("%Y-%m-%d %H:%M")
 
-    save_flow_table(round_numeric_columns(flow_with_time), f"{output_dir}/flow_output.tab")
+    # HoursSinceSurgery was only needed to build the hourly summary above --
+    # drop it before writing the professor-style patient tables so those
+    # files keep the original column structure instead of leaking a helper
+    # column.
+    flow_output = flow_with_time.drop(columns=["HoursSinceSurgery"])
+    cxr_output = cxr_with_time.drop(columns=["HoursSinceSurgery"])
+
+    save_flow_table(round_numeric_columns(flow_output), f"{output_dir}/flow_pump_events.tab")
     removal_predictions = round_numeric_columns(removal_predictions)
     hourly_removals = round_numeric_columns(hourly_removals)
     removal_predictions.to_csv(f"{output_dir}/removal_predictions.csv", index=False)
     hourly_removals.to_csv(f"{output_dir}/hourly_removal_decisions.csv", index=False)
-    cxr_with_time.to_csv(f"{output_dir}/cxr_output.csv", index=False)
+    cxr_output.to_csv(f"{output_dir}/cxr_events.tab", sep="\t", index=False)
 
     return {
         "manifest": manifest_data,
