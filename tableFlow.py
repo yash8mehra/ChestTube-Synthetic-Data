@@ -4,6 +4,14 @@ from sklearn.metrics import roc_auc_score
 
 GRADES = ["Z", "O", "T", "TH"]
 
+# Grade probabilities per finding, calibrated to the real sample's skew toward
+# low-severity readings (Effusion in particular is ~94% "Z" in the real data).
+GRADE_PROBS = {
+    "Effusion": [0.90, 0.08, 0.015, 0.005],
+    "PneumothoraxSize": [0.35, 0.55, 0.05, 0.05],
+    "SubcuEmphysema": [0.35, 0.28, 0.12, 0.25],
+}
+
 
 def round_numeric_columns(df):
     if isinstance(df, pd.DataFrame):
@@ -22,10 +30,14 @@ def make_manifest(num_patients=None):
     surgery_starts = pd.Series(surgery_starts).reset_index(drop=True)
     surgery_type = np.random.choice(["VATS", "Open"], size=num_patients, p=[0.7, 0.3])
 
-    duration_hours = np.random.randint(24, 180, size=num_patients)
-    long_stay_count = min(max(1, round(num_patients * 0.12)), num_patients)
+    # Lognormal core (median ~38-40hrs, matches real median ~44hrs) plus an
+    # explicit long-stay tail out to ~420hrs to match the real data's outliers,
+    # instead of a uniform range that shifts the whole median upward.
+    base_duration = np.random.lognormal(mean=np.log(38), sigma=0.62, size=num_patients)
+    duration_hours = np.clip(base_duration, 16, 220)
+    long_stay_count = min(max(1, round(num_patients * 0.07)), num_patients)
     long_stay_idx = np.random.choice(num_patients, size=long_stay_count, replace=False)
-    duration_hours[long_stay_idx] = np.random.randint(180, 421, size=long_stay_count)
+    duration_hours[long_stay_idx] = np.random.uniform(220, 420, size=long_stay_count)
 
     return pd.DataFrame({
         "StudyID": study_ids,
@@ -58,9 +70,9 @@ def generate_cxr(manifest_data):
             rows.append({
                 "StudyID": studyid,
                 "EventDate": t,
-                "Effusion": np.random.choice(GRADES),
-                "PneumothoraxSize": np.random.choice(GRADES),
-                "SubcuEmphysema": np.random.choice(GRADES),
+                "Effusion": np.random.choice(GRADES, p=GRADE_PROBS["Effusion"]),
+                "PneumothoraxSize": np.random.choice(GRADES, p=GRADE_PROBS["PneumothoraxSize"]),
+                "SubcuEmphysema": np.random.choice(GRADES, p=GRADE_PROBS["SubcuEmphysema"]),
             })
 
         all_cxr.append(pd.DataFrame(rows))
@@ -95,15 +107,24 @@ def sample_segment_rates(n):
         seg_end = min(i + np.random.randint(readings_per_hour, 2 * readings_per_hour + 1), n)
         progress = i / n
 
-        if progress < 0.10:
-            air_base[i:seg_end] = np.random.uniform(40.0, 120.0)
-            fluid_base[i:seg_end] = np.random.uniform(0.8, 4.0)
-        elif progress < 0.35:
-            air_base[i:seg_end] = np.random.uniform(25.0, 80.0)
-            fluid_base[i:seg_end] = np.random.uniform(0.4, 2.0)
+        # Air leak: most segments are low-flow, with occasional moderate/high
+        # states -- this is what keeps the median low while still letting the
+        # mean run high once spikes are layered on top (matches the real
+        # data's heavy right skew: median ~5, mean ~300+).
+        state = np.random.choice(["low", "mod", "high"], p=[0.75, 0.18, 0.07])
+        if state == "low":
+            air_base[i:seg_end] = np.random.uniform(0.1, 3.0)
+        elif state == "mod":
+            air_base[i:seg_end] = np.random.uniform(3.0, 30.0)
         else:
-            air_base[i:seg_end] = np.random.uniform(10.0, 35.0)
-            fluid_base[i:seg_end] = np.random.uniform(0.1, 1.0)
+            air_base[i:seg_end] = np.random.uniform(30.0, 150.0)
+
+        if progress < 0.10:
+            fluid_base[i:seg_end] = np.random.uniform(0.7, 3.6)
+        elif progress < 0.35:
+            fluid_base[i:seg_end] = np.random.uniform(0.35, 1.8)
+        else:
+            fluid_base[i:seg_end] = np.random.uniform(0.1, 0.9)
 
         i = seg_end
 
@@ -113,15 +134,21 @@ def sample_segment_rates(n):
 # Convert the air leak baseline into realistic measured values with occasional spikes.
 def make_air_leak(air_base):
     n = len(air_base)
-    air_leak = air_base * np.abs(np.random.normal(1.2, 0.9, size=n))
-    spike_mask = np.random.random(n) < 0.10
-    air_leak[spike_mask] += np.random.gamma(shape=2.5, scale=300.0, size=spike_mask.sum())
+    air_leak = air_base * np.abs(np.random.normal(1.1, 0.6, size=n))
+    # Spikes are kept rare (1.2% of readings) so most 8h removal-decision
+    # windows stay spike-free -- a higher spike rate pulls the mean toward the
+    # real ~300 target but also makes almost every window fail the flow gate,
+    # which is why removal rate collapsed in the last pass.
+    spike_mask = np.random.random(n) < 0.012
+    air_leak[spike_mask] += np.random.gamma(shape=1.15, scale=13000.0, size=spike_mask.sum())
     return np.clip(np.round(air_leak, 3), 0, 6000)
 
 
-# Create noisy fluid output measurements from the underlying tissue drainage trend.
+# Create noisy, CUMULATIVE fluid output measurements from the underlying
+# drainage trend (the real data is a running total per patient, not a
+# per-reading rate).
 def make_fluid_output(fluid_base):
-    noise = np.random.normal(0, fluid_base * 0.6 + 0.4, size=fluid_base.shape)
+    noise = np.random.normal(0, fluid_base * 0.5 + 0.2, size=fluid_base.shape)
     incremental_flow = np.clip(fluid_base + noise, 0.0, None)
     cumulative_flow = np.cumsum(incremental_flow)
     cumulative_flow = np.maximum.accumulate(cumulative_flow)
@@ -130,6 +157,8 @@ def make_fluid_output(fluid_base):
 
 # Simulate pleural pressure with mild drift and random measurement noise.
 def make_pressure(n):
+    # Real sample is almost entirely positive (mean ~1.25) -- previous version
+    # had the sign flipped relative to the professor's data.
     target = np.random.uniform(0.6, 2.2)
     drift = np.cumsum(np.random.normal(0, 0.01, size=n))
     noise = np.random.normal(0, 0.18, size=n)
@@ -171,11 +200,14 @@ def classify_patient_profile(patient_flow, start_time):
         return "UNKNOWN"
 
     avg_air = window["AirLeakFlow"].mean()
-    avg_fluid_rate = window["LOWESSFluidOutput"].mean() / 10.0
+    fluid_vals = window["LOWESSFluidOutput"]
+    # Fluid is cumulative now, so "rate" has to come from the increase across
+    # the window, not the raw value.
+    avg_fluid_rate = (fluid_vals.max() - fluid_vals.min()) / 24.0 if len(fluid_vals) else 0.0
 
-    if avg_air > 10.0 and avg_fluid_rate > 3.0:
+    if avg_air > 50.0 and avg_fluid_rate > 15.0:
         return "SEVERE"
-    if avg_air > 10.0 or avg_fluid_rate > 3.0:
+    if avg_air > 50.0 or avg_fluid_rate > 15.0:
         return "MODERATE"
     return "MILD"
 
@@ -203,11 +235,14 @@ def validate_cxr_for_removal(patient_cxr, removal_time):
 # Summarize the last 8 hours of flow data into the metrics used for removal criteria.
 def normalized_flow_limits(window_data):
     air_max = window_data["AirLeakFlow"].max()
-    fluid_rate = window_data["LOWESSFluidOutput"].max() / 100.0
+    # BUG FIX: fluid is cumulative now, so the removal-relevant number is how
+    # much was output DURING this window, not the running total-to-date.
+    fluid_series = window_data["LOWESSFluidOutput"]
+    fluid_rate = (fluid_series.max() - fluid_series.min()) / 8.0 if len(fluid_series) else 0.0
     pressure_mean = window_data["MeasuredPleuralPressure"].mean()
     pressure_min = window_data["MeasuredPleuralPressure"].min()
     pressure_ok = pressure_mean > 0.0 and pressure_min > 0.0
-    meets_criteria = air_max <= 2000.0 and fluid_rate <= 60.0 and pressure_ok
+    meets_criteria = air_max <= 3000.0 and fluid_rate <= 40.0 and pressure_ok
     return air_max, fluid_rate, pressure_mean, pressure_ok, meets_criteria
 
 
@@ -260,6 +295,7 @@ def predict_removals_hourly(flow, cxr_data, manifest_data):
             air_max, fluid_rate, pressure_mean, pressure_ok, meets_criteria = normalized_flow_limits(window_data)
             prob = 0.0 if force_no_removal else hourly_removal_probability(hour)
 
+            # CXR is now checked for the whole stay, not just hour <= 72.
             cxr_valid = True
             if meets_criteria:
                 cxr_valid = validate_cxr_for_removal(patient_cxr, hour_end)
@@ -314,7 +350,7 @@ def build_flow_table(manifest_data):
     )
 
 
-# Add hours-since-surgery to a dataframe based on each patient’s surgery start time.
+# Add hours-since-surgery to a dataframe based on each patient's surgery start time.
 def add_time_since_surgery(dataframe, manifest_data, timestamp_column):
     result = dataframe.copy()
     result = result.merge(manifest_data[["StudyID", "SurgeryStart"]], on="StudyID", how="left")
